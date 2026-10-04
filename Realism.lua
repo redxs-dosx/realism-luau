@@ -2,6 +2,7 @@
 -- Executor-friendly: progress and errors also appear as on-screen notifications,
 -- so you don't need to find the console.
 -- v2: added BLEEDING (+ Bandage tool) and WEATHER (rain, wet screen, puddles, lightning)
+-- v3: added TEMPERATURE (+ Campfire tool) and FALL INJURIES (stumble, sprained ankle, knockdown)
 
 local __toasts = 0
 local function __toast(text)
@@ -136,6 +137,39 @@ local CONFIG = {
 	INJURY_VIGNETTE_MAX = 0.8,
 	INJURY_VIGNETTE_COLOR = Color3.fromRGB(160, 0, 0),
 
+	-- Temperature: cold at night, heat at noon. Shade, roofs and fires help.
+	ENABLE_TEMPERATURE = true,
+	TEMP_ADJUST_RATE = 0.04,       -- how fast your body temperature follows your surroundings
+	TEMP_HOT_THIRST = 1.2,         -- extra thirst drain at full heat (+120%)
+	TEMP_COLD_HUNGER = 0.8,        -- extra hunger drain at full cold (+80%)
+	TEMP_REGEN_PENALTY = 0.5,      -- stamina regen lost at full cold or full heat
+	TEMP_HOT_SPRINT_DRAIN = 0.4,   -- extra sprint stamina drain at full heat
+	TEMP_SHADE_RELIEF = 0.65,      -- share of the heat blocked in shade or under a roof
+	TEMP_FIRE_RADIUS = 20,         -- a lit Fire object (yours or the game's) warms you inside this range (studs)
+	TEMP_FIRE_HEAT = 1.0,          -- how much a fire at point-blank range raises your temperature
+	TEMP_DAMAGE_START = 0.9,       -- freezing / overheating starts to hurt beyond this (0 to 1)
+	TEMP_DAMAGE_RATE = 0.25,       -- health per second at the very extreme
+	TEMP_VIGNETTE_MAX = 0.5,       -- frost / heat glow strength at the screen edges
+	CAMPFIRE_LIFETIME = 240,       -- seconds a campfire you light keeps burning
+	CAMPFIRE_COOLDOWN = 2,
+	COLD_TINT = Color3.fromRGB(190, 215, 255),
+	HOT_TINT = Color3.fromRGB(255, 215, 170),
+	COLD_COLOR = Color3.fromRGB(110, 190, 255),
+	HEAT_COLOR = Color3.fromRGB(255, 140, 60),
+
+	-- Fall injuries (landing speed in studs/sec; an ordinary jump lands at about 50)
+	FALL_STUMBLE_SPEED = 62,       -- hard landing: you stagger
+	STUMBLE_MIN_TIME = 0.5,        -- stagger length (grows with the fall)
+	STUMBLE_MAX_TIME = 1.6,
+	STUMBLE_SLOWDOWN = 0.5,        -- how much slower you move at the start of a stagger
+	STUMBLE_STAMINA_COST = 20,
+	FALL_SPRAIN_SPEED = 80,        -- harder landing: sprained ankle, you limp for a while
+	SPRAIN_MIN_TIME = 15,          -- seconds of limping (grows with the fall)
+	SPRAIN_MAX_TIME = 60,
+	FALL_KNOCKDOWN_SPEED = 115,    -- brutal landing: you are thrown to the ground for a moment
+	KNOCKDOWN_MIN_TIME = 1.5,
+	KNOCKDOWN_MAX_TIME = 2.5,
+
 	-- Bleeding: a big hit can start a slow health drain that only a Bandage stops
 	BLEED_HIT_FRACTION = 0.12,     -- one hit must take at least this fraction of max health
 	BLEED_DRAIN_MIN = 0.5,         -- health/sec from the lightest bleed
@@ -156,6 +190,7 @@ local CONFIG = {
 		["Water Bottle"] = true,
 		["Food Bar"] = true,
 		["Bandage"] = true,
+		["Campfire"] = true,
 	},
 	INVISIBLE_TRANSPARENCY = 0.95, -- parts at/above this don't block line of sight
 	ADRENALINE_DECAY = 8.33,
@@ -402,6 +437,30 @@ local bandaging = false
 local bandageStart = 0
 local bandageToken = 0       -- bumped to cancel an in-progress bandage
 
+-- Assigned further down (they need helpers that are defined later in the file)
+local placeCampfire = nil
+local runFallTest = nil
+
+-- Temperature (everything in one table)
+local temp = {
+	body = 0,                -- -1 freezing .. 0 comfortable .. 1 overheating
+	shade = 0,
+	shadeTarget = 0,
+	fire = 0,                -- 0..1 warmth from the nearest fire
+	timer = 0,
+	fires = {},              -- every Fire object in the world
+	campfire = nil,          -- the campfire you lit: { folder, fire, light, embers, born }
+	campfireUsed = -100,
+	warned = -100,
+}
+
+-- Fall injuries
+local fall = {
+	stumbleT = 0, stumbleDur = 1, dir = 1, roll = 0,
+	sprainLeft = 0, sprainStrength = 0,
+	knock = nil,             -- { t, dur, look } while you're knocked down
+}
+
 -- Weather (everything in one table)
 local weather = {
 	rain = 0,                -- current rain strength 0..1 (fades toward target)
@@ -592,7 +651,7 @@ local function setupFirstPersonAndBobbing(character)
 				currentRoll = currentRoll + (targetRoll - currentRoll) * math.clamp(deltaTime * 10, 0, 1)
 				updateHandSway(deltaTime, character, moveSpeed, humanoid.WalkSpeed)
 
-				Camera.CFrame = Camera.CFrame * CFrame.Angles(0, 0, currentRoll)
+				Camera.CFrame = Camera.CFrame * CFrame.Angles(0, 0, currentRoll + fall.roll)
 			end
 		end
 	end
@@ -789,6 +848,32 @@ local function buildBandage()
 	return tool
 end
 
+local function buildCampfireKit()
+	local tool = Instance.new("Tool")
+	tool.Name = "Campfire"
+	tool.RequiresHandle = true
+	tool.CanBeDropped = false
+	tool.ToolTip = "Click to light a campfire ahead of you"
+
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(0.6, 1.2, 0.6)
+	handle.Transparency = 1
+	handle.CanCollide = false
+	handle.Massless = true
+	handle.Parent = tool
+
+	-- A small bundle of firewood tied with twine
+	local wood = Color3.fromRGB(110, 72, 42)
+	for i, x in ipairs({ -0.18, 0, 0.18 }) do
+		addVisual(tool, handle, "Log" .. i, Enum.PartType.Cylinder, Vector3.new(1.2, 0.26, 0.26),
+			CFrame.new(x, 0, (i - 2) * 0.05) * UPRIGHT, wood, Enum.Material.Wood, 0)
+	end
+	cyl(tool, handle, "Twine", 0.1, 0.1, 0.66, Color3.fromRGB(200, 180, 130), Enum.Material.Fabric, 0)
+
+	return tool
+end
+
 -- Plain fallback tool so you always get your gear even if the detailed model fails
 local function simpleTool(name, tip, color)
 	local tool = Instance.new("Tool")
@@ -815,7 +900,7 @@ local function safeBuild(builder, name, tip, color)
 	return simpleTool(name, tip, color)
 end
 
-local GEAR_NAMES = { ["Water Bottle"] = true, ["Food Bar"] = true, ["Bandage"] = true }
+local GEAR_NAMES = { ["Water Bottle"] = true, ["Food Bar"] = true, ["Bandage"] = true, ["Campfire"] = true }
 
 local function createClientGears()
 	task.wait(0.25) -- let the new Backpack exist after a respawn
@@ -874,6 +959,15 @@ local function createClientGears()
 		bandaging = false
 	end)
 	bandageTool.Parent = backpack
+
+	-- Campfire: click to light one ahead of you (warms you, lights up the night)
+	local campTool = safeBuild(buildCampfireKit, "Campfire", "Click to light a campfire ahead of you", Color3.fromRGB(110, 72, 42))
+	campTool.Activated:Connect(function()
+		if os.clock() - temp.campfireUsed < CONFIG.CAMPFIRE_COOLDOWN then return end
+		temp.campfireUsed = os.clock()
+		if placeCampfire then placeCampfire() end
+	end)
+	campTool.Parent = backpack
 end
 
 --------------------------------------------------------------------------------
@@ -1047,8 +1141,8 @@ local function createHUD()
 
 	local hudContainer = Instance.new("Frame")
 	hudContainer.Name = "HUDContainer"
-	hudContainer.Size = UDim2.new(0, 220, 0, 170)
-	hudContainer.Position = UDim2.new(1, -240, 1, -190)
+	hudContainer.Size = UDim2.new(0, 220, 0, 190)
+	hudContainer.Position = UDim2.new(1, -240, 1, -210)
 	hudContainer.BackgroundTransparency = 1
 	hudContainer.Parent = screenGui
 
@@ -1104,16 +1198,19 @@ local function createHUD()
 	local adrenalineFill, adrenalineBG = makeBar("Adrenaline", CONFIG.ADRENALINE_COLOR, 5)
 	local strengthFill = makeBar("Leg Strength", CONFIG.STRENGTH_COLOR, 6)
 	local bleedFill, bleedBG = makeBar("Bleeding", CONFIG.BLEED_COLOR, 7)
+	local tempFill, tempBG = makeBar("Temperature", CONFIG.COLD_COLOR, 8)
+	local tempLabel = tempBG:FindFirstChild("Label")
 
 	adrenalineBG.Visible = false
 	bleedBG.Visible = false
+	tempBG.Visible = false
 
 	-- Mobile touch sprint button (hold to run)
 	if UserInputService.TouchEnabled then
 		local mobileBtn = Instance.new("TextButton")
 		mobileBtn.Name = "MobileSprintButton"
 		mobileBtn.Size = UDim2.new(0, 65, 0, 65)
-		mobileBtn.Position = UDim2.new(1, -95, 1, -275)
+		mobileBtn.Position = UDim2.new(1, -95, 1, -295)
 		mobileBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
 		mobileBtn.BackgroundTransparency = 0.3
 		mobileBtn.Text = "RUN"
@@ -1179,6 +1276,19 @@ local function createHUD()
 		end
 		testButton("BLEED", 70, forceBleed)
 		testButton("STORM", 106, toggleStorm)
+		testButton("NIGHT", 142, function()
+			Lighting.ClockTime = 0
+			temp.body = -0.6
+			showNotice("Midnight")
+		end)
+		testButton("NOON", 178, function()
+			Lighting.ClockTime = 12
+			temp.body = 0.6
+			showNotice("High noon")
+		end)
+		testButton("FALL", 214, function()
+			if runFallTest then runFallTest(100) end
+		end)
 	end
 
 	return {
@@ -1191,6 +1301,9 @@ local function createHUD()
 		AdrenalineBG = adrenalineBG,
 		Bleeding = bleedFill,
 		BleedingBG = bleedBG,
+		Temp = tempFill,
+		TempBG = tempBG,
+		TempLabel = tempLabel,
 	}
 end
 
@@ -1292,6 +1405,8 @@ local function createEdgeOverlay(name, color)
 end
 
 local staminaFrames = createEdgeOverlay("RealismStaminaOverlay", Color3.new(0, 0, 0))
+local coldFrames = createEdgeOverlay("RealismColdOverlay", CONFIG.COLD_TINT)
+local heatFrames = createEdgeOverlay("RealismHeatOverlay", Color3.fromRGB(255, 190, 110))
 
 -- Full-screen black overlay used for passing out and dying
 local blackFrame
@@ -1642,7 +1757,7 @@ local function updateAudio(deltaTime, humanoid, flatSpeed, healthPercent)
 	-- Heavy breathing: low stamina or adrenaline
 	if breathSound then
 		local tired = math.clamp((CONFIG.BREATH_STAMINA_START - stamina) / CONFIG.BREATH_STAMINA_START, 0, 1)
-		local factor = math.max(tired, (adrenaline / 100) * 0.5)
+		local factor = math.max(tired, (adrenaline / 100) * 0.5, math.max(0, temp.body) * 0.4)
 		approachVolume(breathSound, factor * CONFIG.BREATH_MAX_VOLUME, deltaTime, 3)
 		breathSound.PlaybackSpeed = 0.9 + factor * 0.4
 	end
@@ -2430,6 +2545,253 @@ local function updateWeather(dt, character)
 end
 
 --------------------------------------------------------------------------------
+-- 6g. TEMPERATURE
+--------------------------------------------------------------------------------
+-- Track every Fire object in the world so campfires (yours or the game's) can warm you
+local function trackFire(d)
+	if d:IsA("Fire") then temp.fires[d] = true end
+end
+pcall(function()
+	for _, d in ipairs(Workspace:GetDescendants()) do trackFire(d) end
+end)
+track(Workspace.DescendantAdded:Connect(trackFire))
+track(Workspace.DescendantRemoving:Connect(function(d)
+	if d:IsA("Fire") then temp.fires[d] = nil end
+end))
+
+-- 0..1: how much warmth the nearest lit fire gives you at this position
+local function fireWarmth(pos)
+	local best = 0
+	local radius = CONFIG.TEMP_FIRE_RADIUS
+	for fire in pairs(temp.fires) do
+		local holder = fire.Parent
+		local firePos = nil
+		if holder and holder:IsA("BasePart") then
+			firePos = holder.Position
+		elseif holder and holder:IsA("Attachment") then
+			firePos = holder.WorldPosition
+		end
+		if fire.Enabled and firePos then
+			local dist = (firePos - pos).Magnitude
+			local warmth = math.clamp(1 - (dist - radius * 0.3) / (radius * 0.7), 0, 1)
+			if warmth > best then best = warmth end
+		end
+	end
+	return best
+end
+
+-- Light a campfire on the ground a few studs ahead of you
+placeCampfire = function()
+	local character = LocalPlayer.Character
+	local hrp = character and character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	if weather.rain * (1 - weather.sheltered) > 0.6 then
+		showNotice("It's too wet to light a fire out here")
+		return
+	end
+
+	local origin = hrp.Position + hrp.CFrame.LookVector * 4
+	local hit = firstSolidHit(origin, Vector3.new(0, -10, 0), character)
+	if not hit then
+		showNotice("No solid ground to light a fire on")
+		return
+	end
+
+	-- One campfire at a time
+	if temp.campfire and temp.campfire.folder then temp.campfire.folder:Destroy() end
+
+	local folder = trackInstance(Instance.new("Folder"))
+	folder.Name = "RealismCampfire"
+	local base = CFrame.new(hit.Position + Vector3.new(0, 0.05, 0))
+
+	local function part(name, shape, size, cf, color, material)
+		local p = Instance.new("Part")
+		p.Name = name
+		p.Shape = shape
+		p.Size = size
+		p.CFrame = cf
+		p.Color = color
+		p.Material = material
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanQuery = false
+		p.CanTouch = false
+		p.Parent = folder
+		return p
+	end
+
+	-- Ash bed, a ring of leaning logs, and glowing embers in the middle
+	part("Ash", Enum.PartType.Cylinder, Vector3.new(0.1, 3, 3), base * UPRIGHT, Color3.fromRGB(45, 40, 38), Enum.Material.Slate)
+	for i = 1, 5 do
+		part("Log" .. i, Enum.PartType.Cylinder, Vector3.new(2.2, 0.35, 0.35),
+			base * CFrame.Angles(0, math.rad(i * 72), 0) * CFrame.new(0.9, 0.5, 0) * CFrame.Angles(0, 0, math.rad(-25)),
+			Color3.fromRGB(95, 62, 38), Enum.Material.Wood)
+	end
+	local embers = part("Embers", Enum.PartType.Ball, Vector3.new(1.1, 0.6, 1.1), base * CFrame.new(0, 0.3, 0),
+		Color3.fromRGB(255, 120, 40), Enum.Material.Neon)
+	embers.Transparency = 0.25
+
+	local fire = Instance.new("Fire")
+	fire.Size = 7
+	fire.Heat = 9
+	fire.Color = Color3.fromRGB(255, 150, 50)
+	fire.SecondaryColor = Color3.fromRGB(200, 40, 10)
+	fire.Parent = embers
+
+	local light = Instance.new("PointLight")
+	light.Color = Color3.fromRGB(255, 170, 90)
+	light.Range = 26
+	light.Brightness = 2
+	light.Parent = embers
+
+	folder.Parent = Workspace
+	temp.campfire = { folder = folder, fire = fire, light = light, embers = embers, born = os.clock() }
+	showNotice("You light a campfire")
+end
+
+local function updateTemperature(dt, character, humanoid, hrp)
+	-- Keep your campfire burning, flickering, then dying out
+	local cf = temp.campfire
+	if cf then
+		local age = os.clock() - cf.born
+		if not cf.folder.Parent then
+			temp.campfire = nil
+		elseif age > CONFIG.CAMPFIRE_LIFETIME + 20 then
+			cf.folder:Destroy()
+			temp.campfire = nil
+		elseif age > CONFIG.CAMPFIRE_LIFETIME then
+			cf.fire.Enabled = false
+			cf.light.Brightness = math.max(0, cf.light.Brightness - dt * 0.5)
+			cf.embers.Transparency = math.min(1, cf.embers.Transparency + dt * 0.05)
+		else
+			cf.light.Brightness = 2 + math.sin(os.clock() * 17) * 0.3 + math.random() * 0.4
+		end
+	end
+
+	if not CONFIG.ENABLE_TEMPERATURE then
+		temp.body = 0
+		return
+	end
+
+	-- Shade and fire checks (throttled)
+	temp.timer = temp.timer + dt
+	if temp.timer >= 0.3 then
+		temp.timer = 0
+		local sunDir = Lighting:GetSunDirection()
+		local blocked = sunDir.Y < -0.05 or firstSolidHit(Camera.CFrame.Position, sunDir * 500, character) ~= nil
+		temp.shadeTarget = (blocked or weather.sheltered > 0.5) and 1 or 0
+		temp.fire = fireWarmth(hrp.Position)
+	end
+	temp.shade = temp.shade + (temp.shadeTarget - temp.shade) * math.clamp(dt * 3, 0, 1)
+
+	-- What the surroundings feel like right now: sun height sets heat and cold
+	local sunHeight = Lighting:GetSunDirection().Y
+	local hot = math.clamp((sunHeight - 0.45) / 0.5, 0, 1)
+	local cold = math.clamp((0.1 - sunHeight) / 0.7, 0, 1)
+	hot = hot * (1 - weather.rain * 0.5) * (1 - CONFIG.TEMP_SHADE_RELIEF * temp.shade)
+	cold = cold * (1 - 0.3 * weather.sheltered) -- a roof blocks some of the wind
+	local soaked = weather.rain * (1 - weather.sheltered) * 0.3 -- rain chills you
+	local target = math.clamp(hot - cold - soaked + temp.fire * CONFIG.TEMP_FIRE_HEAT, -1, 1)
+
+	-- Your body follows slowly, so a quick dash through the sun or cold barely matters
+	temp.body = temp.body + (target - temp.body) * math.clamp(dt * CONFIG.TEMP_ADJUST_RATE, 0, 1)
+
+	-- Staying at the extreme hurts
+	local extreme = math.abs(temp.body)
+	if extreme > CONFIG.TEMP_DAMAGE_START and humanoid.Health > 0 then
+		local k = (extreme - CONFIG.TEMP_DAMAGE_START) / math.max(1 - CONFIG.TEMP_DAMAGE_START, 0.01)
+		humanoid.Health = math.max(0, humanoid.Health - CONFIG.TEMP_DAMAGE_RATE * k * dt)
+		lastHealth = humanoid.Health -- slow damage shouldn't trigger the adrenaline spike
+	end
+
+	if extreme > 0.6 and os.clock() - temp.warned > 60 then
+		temp.warned = os.clock()
+		if temp.body < 0 then
+			showNotice("You're freezing - find shelter or a fire")
+		else
+			showNotice("You're overheating - find shade and drink")
+		end
+	end
+
+	-- Shivering: small random tremors in the camera
+	if temp.body < -0.3 then
+		landingVelocity = landingVelocity + (math.random() - 0.5) * (-temp.body) * 1.2 * (dt * 60)
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 6h. FALL INJURIES
+--------------------------------------------------------------------------------
+-- Called on a hard landing. Harder falls stack more on top of the normal fall damage:
+-- a stumble first, then a sprained ankle (limp), then being knocked off your feet.
+local function applyFallInjuries(character, humanoid, hrp, speed)
+	local severity = math.clamp(
+		(speed - CONFIG.FALL_STUMBLE_SPEED) / math.max(CONFIG.FALL_KNOCKDOWN_SPEED - CONFIG.FALL_STUMBLE_SPEED, 1),
+		0, 1
+	)
+
+	-- Stumble: you stagger, lose some breath, and the screen lurches
+	local dur = CONFIG.STUMBLE_MIN_TIME + (CONFIG.STUMBLE_MAX_TIME - CONFIG.STUMBLE_MIN_TIME) * severity
+	fall.stumbleT = dur
+	fall.stumbleDur = dur
+	fall.dir = (math.random() < 0.5) and -1 or 1
+	stamina = math.max(0, stamina - CONFIG.STUMBLE_STAMINA_COST * (0.5 + severity * 0.5))
+	landingVelocity = landingVelocity - 3 - severity * 4
+	showNotice("You stumble on the landing")
+
+	-- Sprained ankle: you limp for a while, even at full health
+	if speed > CONFIG.FALL_SPRAIN_SPEED then
+		local s = math.clamp(
+			(speed - CONFIG.FALL_SPRAIN_SPEED) / math.max(CONFIG.FALL_KNOCKDOWN_SPEED - CONFIG.FALL_SPRAIN_SPEED, 1),
+			0, 1
+		)
+		fall.sprainLeft = math.max(fall.sprainLeft, CONFIG.SPRAIN_MIN_TIME + (CONFIG.SPRAIN_MAX_TIME - CONFIG.SPRAIN_MIN_TIME) * s)
+		fall.sprainStrength = math.max(fall.sprainStrength, 0.5 + 0.5 * s)
+		showNotice("You twisted your ankle")
+	end
+
+	-- Knockdown: thrown to the ground for a moment
+	if speed >= CONFIG.FALL_KNOCKDOWN_SPEED and humanoid.Health > 0 and not ragdollData then
+		local camLook = Camera.CFrame.LookVector
+		local look = Vector3.new(camLook.X, 0, camLook.Z)
+		if look.Magnitude < 0.01 then
+			look = Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z)
+		end
+		look = look.Unit
+		fall.knock = { t = 0, dur = randRange(CONFIG.KNOCKDOWN_MIN_TIME, CONFIG.KNOCKDOWN_MAX_TIME), look = look }
+		startRagdoll(character, look * 0.3)
+	end
+end
+
+runFallTest = function(speed)
+	local char = LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if hum and root and hum.Health > 0 and not faint then
+		applyFallInjuries(char, hum, root, speed)
+	end
+end
+
+local function updateKnockdown(dt, character, humanoid, hrp)
+	local k = fall.knock
+	if not k then return end
+	if faint then
+		fall.knock = nil
+		return
+	end
+
+	peakFallSpeed = 0 -- tumbling shouldn't count as another fall
+	k.t = k.t + dt
+	if k.t >= k.dur then
+		fall.knock = nil
+		stopRagdoll(character, humanoid, hrp, k.look)
+		fall.stumbleT = 0.8 -- wobbly as you get back up
+		fall.stumbleDur = 0.8
+	end
+end
+
+--------------------------------------------------------------------------------
 -- 7. MAIN UPDATE LOOP
 --------------------------------------------------------------------------------
 local function mainUpdate(deltaTime)
@@ -2468,6 +2830,10 @@ local function mainUpdate(deltaTime)
 	end
 
 	updateFaint(deltaTime, character, humanoid, hrp)
+	updateKnockdown(deltaTime, character, humanoid, hrp)
+	safeCall("temperature", updateTemperature, deltaTime, character, humanoid, hrp)
+	local coldAmt = math.max(0, -temp.body)
+	local heatAmt = math.max(0, temp.body)
 
 	if LocalPlayer.CameraMode ~= Enum.CameraMode.LockFirstPerson then
 		LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
@@ -2486,6 +2852,8 @@ local function mainUpdate(deltaTime)
 		peakFallSpeed = math.max(peakFallSpeed, -hrp.AssemblyLinearVelocity.Y)
 	end
 
+	if fall.knock then peakFallSpeed = 0 end
+
 	if wasAirborne and not airborne then
 		if peakFallSpeed > CONFIG.LANDING_MIN_SPEED then
 			landingVelocity = landingVelocity - math.clamp(peakFallSpeed * 0.08, 0, 7)
@@ -2497,6 +2865,11 @@ local function mainUpdate(deltaTime)
 				0, 1
 			)
 			humanoid:TakeDamage(humanoid.MaxHealth * severity)
+		end
+
+		-- Fall injuries: stumble, then a sprained ankle, then a knockdown
+		if peakFallSpeed > CONFIG.FALL_STUMBLE_SPEED and not faint and not fall.knock then
+			applyFallInjuries(character, humanoid, hrp, peakFallSpeed)
 		end
 
 		peakFallSpeed = 0
@@ -2541,10 +2914,11 @@ local function mainUpdate(deltaTime)
 
 	if isSprinting then
 		local drainMultiplier = isAdrenalineActive and CONFIG.ADRENALINE_STAMINA_DRAIN_MULT or 1
-		stamina = math.clamp(stamina - (CONFIG.STAMINA_DRAIN_RATE * drainMultiplier * deltaTime), 0, CONFIG.MAX_STAMINA)
+		stamina = math.clamp(stamina - (CONFIG.STAMINA_DRAIN_RATE * drainMultiplier * (1 + heatAmt * CONFIG.TEMP_HOT_SPRINT_DRAIN) * deltaTime), 0, CONFIG.MAX_STAMINA)
 	else
 		-- Walking barely recovers stamina; standing still recovers it quickly
 		local regen = isMoving and CONFIG.STAMINA_REGEN_WALK or CONFIG.STAMINA_REGEN_RATE
+		regen = regen * (1 - CONFIG.TEMP_REGEN_PENALTY * math.max(coldAmt, heatAmt)) -- extreme temperatures slow recovery
 		stamina = math.clamp(stamina + (regen * deltaTime), 0, CONFIG.MAX_STAMINA)
 	end
 
@@ -2553,7 +2927,7 @@ local function mainUpdate(deltaTime)
 		if exhausted and isMoving then
 			faintThreshold = faintThreshold or (CONFIG.FAINT_MIN_TIME + math.random() * (CONFIG.FAINT_MAX_TIME - CONFIG.FAINT_MIN_TIME))
 			faintTimer = faintTimer + deltaTime
-			if faintTimer >= faintThreshold then
+			if faintTimer >= faintThreshold and not fall.knock then
 				startFaint(character, humanoid, hrp)
 			end
 		elseif exhausted then
@@ -2572,7 +2946,7 @@ local function mainUpdate(deltaTime)
 	end
 
 	-- C4. Mantling
-	if not faint then
+	if not faint and not fall.knock then
 		safeCall("mantle", updateMantle, deltaTime, humanoid, hrp, character)
 	end
 
@@ -2591,8 +2965,9 @@ local function mainUpdate(deltaTime)
 	motionBlur.Size = motionBlur.Size + (targetBlur - motionBlur.Size) * math.clamp(deltaTime * 12, 0, 1)
 
 	-- E. Hunger & thirst decay
-	hunger = math.clamp(hunger - (CONFIG.HUNGER_DECAY * deltaTime), 0, 100)
-	thirst = math.clamp(thirst - (CONFIG.THIRST_DECAY * deltaTime), 0, 100)
+	-- Cold burns food faster; heat makes you thirstier
+	hunger = math.clamp(hunger - (CONFIG.HUNGER_DECAY * (1 + coldAmt * CONFIG.TEMP_COLD_HUNGER) * deltaTime), 0, 100)
+	thirst = math.clamp(thirst - (CONFIG.THIRST_DECAY * (1 + heatAmt * CONFIG.TEMP_HOT_THIRST) * deltaTime), 0, 100)
 
 	-- E2. Starvation / dehydration damage (both empty = much more damage)
 	local emptyBars = (hunger <= 0 and 1 or 0) + (thirst <= 0 and 1 or 0)
@@ -2629,7 +3004,25 @@ local function mainUpdate(deltaTime)
 	-- Injury limp: slower and uneven below the health threshold
 	local hpFraction = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
 	limpFactor = math.clamp((CONFIG.LIMP_HEALTH_THRESHOLD - hpFraction) / CONFIG.LIMP_HEALTH_THRESHOLD, 0, 1)
+
+	-- A twisted ankle from a hard fall also makes you limp, easing off over time
+	if fall.sprainLeft > 0 then
+		fall.sprainLeft = math.max(0, fall.sprainLeft - deltaTime)
+		limpFactor = math.max(limpFactor, fall.sprainStrength * math.clamp(fall.sprainLeft / 8, 0, 1))
+	else
+		fall.sprainStrength = 0
+	end
 	targetSpeed = targetSpeed * (1 - CONFIG.LIMP_MAX_SLOWDOWN * limpFactor)
+
+	-- Stumble: staggering after a hard landing (slower, with a swaying camera)
+	if fall.stumbleT > 0 then
+		fall.stumbleT = math.max(0, fall.stumbleT - deltaTime)
+		local k = fall.stumbleT / math.max(fall.stumbleDur, 0.01)
+		targetSpeed = targetSpeed * (1 - CONFIG.STUMBLE_SLOWDOWN * k)
+		fall.roll = math.sin(os.clock() * 14) * math.rad(5) * k * fall.dir
+	else
+		fall.roll = 0
+	end
 
 	-- Wrapping a bandage slows you down
 	if bandaging then
@@ -2655,7 +3048,7 @@ local function mainUpdate(deltaTime)
 
 	sunRays.Intensity = 0.18 + sunGlare * CONFIG.SUN_RAYS_MAX
 	sunRays.Spread = 0.85 + sunGlare * 0.15
-	bloom.Intensity = 0.45 + sunGlare * CONFIG.SUN_BLOOM_MAX + flash * 1.2
+	bloom.Intensity = 0.45 + sunGlare * CONFIG.SUN_BLOOM_MAX + flash * 1.2 + heatAmt * 0.3
 	bloom.Threshold = 0.92 - sunGlare * 0.4
 	bloom.Size = 24 + sunGlare * 40
 	atmosphere.Glare = 0.45 + sunGlare * 1.5
@@ -2669,8 +3062,8 @@ local function mainUpdate(deltaTime)
 
 	local targetBrightness = 0.02 + (0.13 * adrenalinePercent) + sunGlare * 0.2 + flash * 0.2
 	local targetContrast = 0.15 + (0.05 * adrenalinePercent) - sunGlare * 0.1
-	local targetSaturation = 0.1 + (0.1 * adrenalinePercent) - sunGlare * 0.25 - injuryVisual * 0.3 - staminaVisual * 0.15 - weather.rain * 0.12
-	local targetTint = WHITE:Lerp(WARM_TINT, golden * day * 0.5 * (1 - weather.rain)):Lerp(PAIN_TINT, injuryVisual * CONFIG.INJURY_TINT_MAX)
+	local targetSaturation = 0.1 + (0.1 * adrenalinePercent) - sunGlare * 0.25 - injuryVisual * 0.3 - staminaVisual * 0.15 - weather.rain * 0.12 - coldAmt * 0.1
+	local targetTint = WHITE:Lerp(WARM_TINT, golden * day * 0.5 * (1 - weather.rain)):Lerp(CONFIG.COLD_TINT, coldAmt * 0.35):Lerp(CONFIG.HOT_TINT, heatAmt * 0.3):Lerp(PAIN_TINT, injuryVisual * CONFIG.INJURY_TINT_MAX)
 
 	colorCorrection.Brightness = colorCorrection.Brightness + (targetBrightness - colorCorrection.Brightness) * blend
 	colorCorrection.Contrast = colorCorrection.Contrast + (targetContrast - colorCorrection.Contrast) * blend
@@ -2687,6 +3080,16 @@ local function mainUpdate(deltaTime)
 	local staminaAlpha = staminaVisual * CONFIG.STAMINA_VIGNETTE_MAX
 	for _, frame in ipairs(staminaFrames) do
 		frame.BackgroundTransparency = 1 - staminaAlpha
+	end
+
+	-- Frost creeps in from the edges when cold; a warm glare when hot
+	local frostAlpha = math.max(0, (coldAmt - 0.15) / 0.85) * CONFIG.TEMP_VIGNETTE_MAX
+	for _, frame in ipairs(coldFrames) do
+		frame.BackgroundTransparency = 1 - frostAlpha
+	end
+	local heatAlpha = math.max(0, (heatAmt - 0.15) / 0.85) * CONFIG.TEMP_VIGNETTE_MAX * 0.5
+	for _, frame in ipairs(heatFrames) do
+		frame.BackgroundTransparency = 1 - heatAlpha
 	end
 
 	-- F3b. Audio
@@ -2727,6 +3130,19 @@ local function mainUpdate(deltaTime)
 		bars.Bleeding.Size = UDim2.new(shown, 0, 1, 0)
 	else
 		bars.BleedingBG.Visible = false
+	end
+
+	-- Temperature bar: only shows when you're noticeably cold or hot
+	local tempAmt = math.abs(temp.body)
+	if tempAmt > 0.15 then
+		bars.TempBG.Visible = true
+		bars.Temp.Size = UDim2.new(tempAmt, 0, 1, 0)
+		bars.Temp.BackgroundColor3 = temp.body < 0 and CONFIG.COLD_COLOR or CONFIG.HEAT_COLOR
+		if bars.TempLabel then
+			bars.TempLabel.Text = temp.body < 0 and "COLD" or "HOT"
+		end
+	else
+		bars.TempBG.Visible = false
 	end
 
 	-- H. Day / night cycle
@@ -2789,6 +3205,13 @@ local function resetStateForNewCharacter()
 	weather.lightning = nil
 	weather.flash = 0
 	clearScreenDrops()
+
+	-- Fresh body: comfortable temperature, no injuries
+	temp.body = 0
+	temp.shade, temp.shadeTarget, temp.fire = 0, 0, 0
+	fall.stumbleT, fall.roll = 0, 0
+	fall.sprainLeft, fall.sprainStrength = 0, 0
+	fall.knock = nil
 end
 
 -- Each system starts on its own, so one failing never stops the others
