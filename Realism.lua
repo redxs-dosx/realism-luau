@@ -1137,7 +1137,22 @@ local function createHUD()
 	local screenGui = trackInstance(Instance.new("ScreenGui"))
 	screenGui.Name = "RealismHUD"
 	screenGui.ResetOnSpawn = false
+	screenGui.DisplayOrder = 10 -- above the game's own GUIs
 	screenGui.Parent = playerGui
+
+	-- Version tag: if you can't see this above the bars, you're running an old copy
+	local versionTag = Instance.new("TextLabel")
+	versionTag.Name = "VersionTag"
+	versionTag.Size = UDim2.new(0, 220, 0, 18)
+	versionTag.Position = UDim2.new(1, -240, 1, -232)
+	versionTag.BackgroundTransparency = 1
+	versionTag.Text = "Realism v3"
+	versionTag.TextColor3 = Color3.fromRGB(255, 255, 255)
+	versionTag.TextStrokeTransparency = 0.5
+	versionTag.TextXAlignment = Enum.TextXAlignment.Right
+	versionTag.Font = Enum.Font.GothamBold
+	versionTag.TextSize = 12
+	versionTag.Parent = screenGui
 
 	local hudContainer = Instance.new("Frame")
 	hudContainer.Name = "HUDContainer"
@@ -1258,10 +1273,11 @@ local function createHUD()
 		local function testButton(text, y, onClick)
 			local b = Instance.new("TextButton")
 			b.Name = "Test" .. text
-			b.Size = UDim2.new(0, 80, 0, 30)
-			b.Position = UDim2.new(0, 10, 0, y)
+			b.Size = UDim2.new(0, 90, 0, 34)
+			b.Position = UDim2.new(1, -110, 0.25, y)
 			b.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-			b.BackgroundTransparency = 0.3
+			b.BackgroundTransparency = 0.15
+			b.ZIndex = 5
 			b.Text = text
 			b.TextColor3 = Color3.fromRGB(255, 255, 255)
 			b.Font = Enum.Font.GothamBold
@@ -1272,21 +1288,26 @@ local function createHUD()
 			c.CornerRadius = UDim.new(0, 6)
 			c.Parent = b
 
+			local outline = Instance.new("UIStroke")
+			outline.Color = Color3.fromRGB(255, 255, 255)
+			outline.Thickness = 1.5
+			outline.Parent = b
+
 			b.Activated:Connect(onClick)
 		end
-		testButton("BLEED", 70, forceBleed)
-		testButton("STORM", 106, toggleStorm)
-		testButton("NIGHT", 142, function()
+		testButton("BLEED", 0, forceBleed)
+		testButton("STORM", 42, toggleStorm)
+		testButton("NIGHT", 84, function()
 			Lighting.ClockTime = 0
 			temp.body = -0.6
 			showNotice("Midnight")
 		end)
-		testButton("NOON", 178, function()
+		testButton("NOON", 126, function()
 			Lighting.ClockTime = 12
 			temp.body = 0.6
 			showNotice("High noon")
 		end)
-		testButton("FALL", 214, function()
+		testButton("FALL", 168, function()
 			if runFallTest then runFallTest(100) end
 		end)
 	end
@@ -3251,7 +3272,7 @@ if CONFIG.DEBUG_KEYS then
 	end))
 end
 
-__toast("loaded OK. G = pass out. Tap the BLEED / STORM buttons (or press J / K) to test.")
+__toast("v3 loaded OK. Test buttons are on the right side of the screen (or press G / J / K).")
 
 --------------------------------------------------------------------------------
 -- CLEANUP (runs automatically if the script is executed again)
