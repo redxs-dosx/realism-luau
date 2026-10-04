@@ -1273,11 +1273,10 @@ local function createHUD()
 		local function testButton(text, y, onClick)
 			local b = Instance.new("TextButton")
 			b.Name = "Test" .. text
-			b.Size = UDim2.new(0, 90, 0, 34)
-			b.Position = UDim2.new(1, -110, 0.25, y)
+			b.Size = UDim2.new(0, 80, 0, 30)
+			b.Position = UDim2.new(0, 10, 0, y)
 			b.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-			b.BackgroundTransparency = 0.15
-			b.ZIndex = 5
+			b.BackgroundTransparency = 0.3
 			b.Text = text
 			b.TextColor3 = Color3.fromRGB(255, 255, 255)
 			b.Font = Enum.Font.GothamBold
@@ -1288,26 +1287,21 @@ local function createHUD()
 			c.CornerRadius = UDim.new(0, 6)
 			c.Parent = b
 
-			local outline = Instance.new("UIStroke")
-			outline.Color = Color3.fromRGB(255, 255, 255)
-			outline.Thickness = 1.5
-			outline.Parent = b
-
 			b.Activated:Connect(onClick)
 		end
-		testButton("BLEED", 0, forceBleed)
-		testButton("STORM", 42, toggleStorm)
-		testButton("NIGHT", 84, function()
+		testButton("BLEED", 70, forceBleed)
+		testButton("STORM", 106, toggleStorm)
+		testButton("NIGHT", 142, function()
 			Lighting.ClockTime = 0
 			temp.body = -0.6
 			showNotice("Midnight")
 		end)
-		testButton("NOON", 126, function()
+		testButton("NOON", 178, function()
 			Lighting.ClockTime = 12
 			temp.body = 0.6
 			showNotice("High noon")
 		end)
-		testButton("FALL", 168, function()
+		testButton("FALL", 214, function()
 			if runFallTest then runFallTest(100) end
 		end)
 	end
@@ -3272,7 +3266,7 @@ if CONFIG.DEBUG_KEYS then
 	end))
 end
 
-__toast("v3 loaded OK. Test buttons are on the right side of the screen (or press G / J / K).")
+__toast("v3 loaded OK. Test buttons are on the left side of the screen (or press G / J / K).")
 
 --------------------------------------------------------------------------------
 -- CLEANUP (runs automatically if the script is executed again)
