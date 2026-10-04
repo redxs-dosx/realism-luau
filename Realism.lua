@@ -142,7 +142,10 @@ local CONFIG = {
 	BLEED_DRAIN_MAX = 2.5,         -- health/sec from the worst bleed
 	BANDAGE_USE_TIME = 3,          -- seconds to wrap the wound (keep the Bandage equipped)
 	BANDAGE_MOVE_MULT = 0.75,      -- walk speed multiplier while wrapping
-	BLOOD_DROP_RATE = 1.5,         -- blood drips on the screen per second at the worst bleed
+	BLOOD_DROP_RATE = 0,           -- blood drips on the screen per second at the worst bleed (0 = off)
+	ENABLE_BLOOD_POOLS = true,     -- leave blood on the ground behind you while you bleed
+	BLOOD_MAX_POOLS = 80,          -- oldest blood is removed past this many (keeps it light)
+	BLOOD_POOL_MAX = 3.5,          -- widest a pool can spread while you stand still (studs)
 
 	-- Adrenaline System
 	THREAT_RADIUS = 40,
@@ -187,7 +190,11 @@ local CONFIG = {
 	RAIN_FADE_TIME = 12,           -- seconds to fade a shower in or out
 	FIRST_RAIN_MIN = 10,           -- the first shower after you run the script starts after this many seconds (random min/max)
 	FIRST_RAIN_MAX = 25,
-	RAIN_STREAKS = 70,             -- rain streaks drawn on screen at full intensity (needs no assets)
+	RAIN_STREAKS = 240,            -- 3D raindrops around you at full intensity (lower this if it lags)
+	RAIN_RADIUS = 28,              -- how far around you the rain falls (studs)
+	RAIN_SPEED = 65,               -- fall speed (studs/sec)
+	RAIN_LENGTH = 4,               -- length of each streak (studs)
+	RAIN_SLANT = -0.12,            -- wind slant (negative = blows left, 0 = straight down)
 	RAIN_PARTICLES = false,        -- optional 3D particle rain (only looks right with a good RAIN_TEXTURE)
 	TEST_BUTTONS = true,           -- on-screen BLEED and STORM buttons (handy on mobile / for testing)
 	RAIN_DARKEN = 0.35,            -- how much rain dims the daylight (0 = none)
@@ -1992,6 +1999,95 @@ local function tryStartBleed(damage, maxHealth)
 	end
 end
 
+-- Blood on the ground: a trail of small drops and the odd big splat while you walk,
+-- and a pool that keeps spreading under you while you stand still.
+local bloodPools = {}          -- oldest first
+local bloodLastPos = nil
+local bloodDist = 0
+local bloodDropCount = 0
+local bloodGrowTimer = 0
+
+local function placeBlood(origin, character, diameter)
+	local hit = firstSolidHit(origin, Vector3.new(0, -10, 0), character)
+	if not hit or not hit.Instance.Anchored then return nil end
+
+	local pool = Instance.new("Part")
+	pool.Name = "RealismBlood"
+	pool.Shape = Enum.PartType.Cylinder
+	pool.Size = Vector3.new(0.05, diameter, diameter) -- thin disc: X is the thickness
+	pool.Anchored = true
+	pool.CanCollide = false
+	pool.CanQuery = false
+	pool.CanTouch = false
+	pool.CastShadow = false
+	pool.Material = Enum.Material.SmoothPlastic
+	pool.Reflectance = 0.08
+	pool.Color = Color3.fromRGB(math.random(85, 120), 5, 8)
+
+	-- Lay the disc flat on the surface (a tiny height change per pool stops flickering overlaps)
+	local normal = hit.Normal
+	local pos = hit.Position + normal * (0.03 + (#bloodPools % 5) * 0.004)
+	local up = math.abs(normal.Y) > 0.99 and Vector3.zAxis or Vector3.yAxis
+	pool.CFrame = CFrame.lookAt(pos, pos + normal, up) * CFrame.Angles(0, math.pi / 2, 0)
+	pool.Parent = Workspace
+
+	table.insert(bloodPools, pool)
+	if #bloodPools > CONFIG.BLOOD_MAX_POOLS then
+		local oldest = table.remove(bloodPools, 1)
+		oldest:Destroy()
+	end
+	return pool
+end
+
+local function updateBlood(dt, character, humanoid, hrp)
+	if not CONFIG.ENABLE_BLOOD_POOLS or bleedSeverity <= 0 or humanoid.FloorMaterial == Enum.Material.Air then
+		bloodLastPos = nil
+		return
+	end
+
+	local vel = hrp.AssemblyLinearVelocity
+	local flat = Vector3.new(vel.X, 0, vel.Z)
+	local pos = hrp.Position
+	if bloodLastPos then
+		local moved = Vector3.new(pos.X - bloodLastPos.X, 0, pos.Z - bloodLastPos.Z)
+		bloodDist = bloodDist + moved.Magnitude
+	end
+	bloodLastPos = pos
+
+	local scale = 0.7 + bleedSeverity * 0.6
+	local back = Vector3.zero
+	if flat.Magnitude > 1 then back = -flat.Unit * 0.7 end -- a little behind your feet
+
+	-- Walking: leave a drop every couple of studs (more often the worse the bleed)
+	if bloodDist >= 2.2 - 1.2 * bleedSeverity then
+		bloodDist = 0
+		bloodDropCount = bloodDropCount + 1
+		local big = bloodDropCount % 4 == 0
+		local d = (big and (1.0 + math.random() * 0.7) or (0.35 + math.random() * 0.35)) * scale
+		local jitter = Vector3.new(randRange(-0.4, 0.4), 0, randRange(-0.4, 0.4))
+		placeBlood(pos + back + jitter, character, d)
+	end
+
+	-- Standing still: the pool underneath you keeps spreading
+	if flat.Magnitude < 1 then
+		bloodGrowTimer = bloodGrowTimer + dt
+		if bloodGrowTimer >= 0.4 then
+			bloodGrowTimer = 0
+			local last = bloodPools[#bloodPools]
+			local near = last and last.Parent
+				and (Vector3.new(pos.X, last.Position.Y, pos.Z) - last.Position).Magnitude < last.Size.Y / 2 + 1.5
+			if near then
+				local d = math.min(last.Size.Y + 0.12, CONFIG.BLOOD_POOL_MAX * scale)
+				last.Size = Vector3.new(0.05, d, d)
+			else
+				placeBlood(pos, character, 0.8 * scale)
+			end
+		end
+	else
+		bloodGrowTimer = 0
+	end
+end
+
 --------------------------------------------------------------------------------
 -- 6f. SCREEN DROPS (rain water + blood), RAIN, LIGHTNING & WEATHER
 --------------------------------------------------------------------------------
@@ -2037,62 +2133,93 @@ end
 
 createScreenDrops()
 
--- Rain streaks drawn straight on the screen: plain white lines, so no assets are needed
+-- Real 3D rain: lots of thin streaks falling in a column around you. They are Beams
+-- (solid colored ribbons), so no texture IDs are needed. A single invisible part
+-- follows your camera and holds all the attachments.
+local rainRig = nil
 local rainStreaks = {}
 
+local function respawnStreak(s, y)
+	local angle = math.random() * math.pi * 2
+	local r = 1.5 + math.sqrt(math.random()) * (CONFIG.RAIN_RADIUS - 1.5)
+	s.x = math.cos(angle) * r
+	s.z = math.sin(angle) * r
+	s.y = y
+end
+
 local function createRainStreaks()
-	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
-
-	local existing = playerGui:FindFirstChild("RealismRainStreaks")
-	if existing then existing:Destroy() end
-
-	local gui = trackInstance(Instance.new("ScreenGui"))
-	gui.Name = "RealismRainStreaks"
-	gui.ResetOnSpawn = false
-	gui.IgnoreGuiInset = true
-	gui.DisplayOrder = -4
-	gui.Parent = playerGui
+	local rig = trackInstance(Instance.new("Part"))
+	rig.Name = "RealismRainRig"
+	rig.Anchored = true
+	rig.CanCollide = false
+	rig.CanQuery = false
+	rig.CanTouch = false
+	rig.CastShadow = false
+	rig.Transparency = 1
+	rig.Size = Vector3.new(1, 1, 1)
+	rig.Parent = Workspace
 
 	for _ = 1, CONFIG.RAIN_STREAKS do
-		local frame = Instance.new("Frame")
-		frame.AnchorPoint = Vector2.new(0.5, 0.5)
-		frame.Size = UDim2.fromOffset(2, 30 + math.random() * 35)
-		frame.Rotation = 12
-		frame.BackgroundColor3 = Color3.fromRGB(205, 220, 240)
-		frame.BackgroundTransparency = 0.65
-		frame.BorderSizePixel = 0
-		frame.Visible = false
-		frame.Parent = gui
+		local top = Instance.new("Attachment")
+		top.Parent = rig
+		local bottom = Instance.new("Attachment")
+		bottom.Parent = rig
 
-		table.insert(rainStreaks, {
-			frame = frame,
-			x = math.random() * 1.2,
-			y = math.random() * 1.2 - 0.1,
-			speed = 1.1 + math.random() * 0.8, -- screen heights per second
-		})
+		local beam = Instance.new("Beam")
+		beam.Attachment0 = top
+		beam.Attachment1 = bottom
+		beam.FaceCamera = true
+		beam.Segments = 1
+		beam.Width0 = 0.03
+		beam.Width1 = 0.05
+		beam.LightEmission = 0.4
+		beam.LightInfluence = 0.6
+		beam.Color = ColorSequence.new(Color3.fromRGB(215, 228, 245))
+		beam.Transparency = NumberSequence.new(0.85, 0.45) -- faint tail, brighter head
+		beam.Enabled = false
+		beam.Parent = rig
+
+		local s = {
+			top = top, bottom = bottom, beam = beam, on = false,
+			x = 0, y = 0, z = 0,
+			speed = CONFIG.RAIN_SPEED * (0.85 + math.random() * 0.3),
+		}
+		respawnStreak(s, math.random() * (CONFIG.RAIN_HEIGHT + 10) - 10)
+		table.insert(rainStreaks, s)
 	end
+	rainRig = rig
 end
 
 createRainStreaks()
 
 local function updateRainStreaks(dt)
-	local amount = weather.rain * (1 - weather.sheltered * 0.9)
-	local visibleCount = math.floor(amount * #rainStreaks + 0.5)
-	local view = Camera.ViewportSize
-	local aspect = view.Y / math.max(view.X, 1)
+	if not rainRig then return end
+	rainRig.CFrame = CFrame.new(Camera.CFrame.Position)
+
+	-- How many streaks are falling right now (none under a roof)
+	local amount = weather.rain * (1 - weather.sheltered)
+	local count = math.floor(amount * #rainStreaks + 0.5)
+
+	local dir = Vector3.new(CONFIG.RAIN_SLANT, -1, 0.04).Unit
+	local half = dir * (CONFIG.RAIN_LENGTH * 0.5)
 
 	for i, s in ipairs(rainStreaks) do
-		local show = i <= visibleCount
+		local show = i <= count
 		if show then
-			s.y = s.y + s.speed * dt
-			s.x = s.x - s.speed * 0.21 * aspect * dt -- falls slightly to the left
-			if s.y > 1.1 or s.x < -0.1 then
-				s.y = -0.1
-				s.x = math.random() * 1.2
+			s.y = s.y + dir.Y * s.speed * dt
+			s.x = s.x + dir.X * s.speed * dt
+			s.z = s.z + dir.Z * s.speed * dt
+			if s.y < -10 then
+				respawnStreak(s, CONFIG.RAIN_HEIGHT)
 			end
-			s.frame.Position = UDim2.fromScale(s.x, s.y)
+			local center = Vector3.new(s.x, s.y, s.z)
+			s.top.Position = center - half
+			s.bottom.Position = center + half
 		end
-		if s.frame.Visible ~= show then s.frame.Visible = show end
+		if s.on ~= show then
+			s.on = show
+			s.beam.Enabled = show
+		end
 	end
 end
 
@@ -2482,6 +2609,9 @@ local function mainUpdate(deltaTime)
 		lastHealth = humanoid.Health -- slow damage shouldn't trigger the adrenaline spike or re-roll bleeding
 	end
 
+	-- E4. Blood trail on the ground
+	safeCall("blood", updateBlood, deltaTime, character, humanoid, hrp)
+
 	-- F. WalkSpeed & FOV
 	local adrenalinePercent = adrenaline / 100
 	local runSpeed = CONFIG.ADRENALINE_SPEED + (CONFIG.MAX_RUN_SPEED - CONFIG.ADRENALINE_SPEED) * (legStrength / 100)
@@ -2775,6 +2905,11 @@ _G.RealismCleanup = function()
 			end
 		end
 	end
+
+	for _, pool in ipairs(bloodPools) do
+		if pool then pool:Destroy() end
+	end
+	table.clear(bloodPools)
 
 	_G.RealismCleanup = nil
 end
