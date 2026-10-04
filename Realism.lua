@@ -1,6 +1,7 @@
 -- Realism LocalScript (single-file, client-only)
 -- Executor-friendly: progress and errors also appear as on-screen notifications,
 -- so you don't need to find the console.
+-- v2: added BLEEDING (+ Bandage tool) and WEATHER (rain, wet screen, puddles, lightning)
 
 local __toasts = 0
 local function __toast(text)
@@ -135,6 +136,14 @@ local CONFIG = {
 	INJURY_VIGNETTE_MAX = 0.8,
 	INJURY_VIGNETTE_COLOR = Color3.fromRGB(160, 0, 0),
 
+	-- Bleeding: a big hit can start a slow health drain that only a Bandage stops
+	BLEED_HIT_FRACTION = 0.12,     -- one hit must take at least this fraction of max health
+	BLEED_DRAIN_MIN = 0.5,         -- health/sec from the lightest bleed
+	BLEED_DRAIN_MAX = 2.5,         -- health/sec from the worst bleed
+	BANDAGE_USE_TIME = 3,          -- seconds to wrap the wound (keep the Bandage equipped)
+	BANDAGE_MOVE_MULT = 0.75,      -- walk speed multiplier while wrapping
+	BLOOD_DROP_RATE = 1.5,         -- blood drips on the screen per second at the worst bleed
+
 	-- Adrenaline System
 	THREAT_RADIUS = 40,
 	THREAT_REQUIRE_ON_SCREEN = true,
@@ -143,6 +152,7 @@ local CONFIG = {
 	THREAT_IGNORE_TOOLS = {
 		["Water Bottle"] = true,
 		["Food Bar"] = true,
+		["Bandage"] = true,
 	},
 	INVISIBLE_TRANSPARENCY = 0.95, -- parts at/above this don't block line of sight
 	ADRENALINE_DECAY = 8.33,
@@ -166,6 +176,49 @@ local CONFIG = {
 	-- Day / Night Cycle
 	ENABLE_DAY_NIGHT = true,
 	DAY_NIGHT_SPEED = 0.03,
+
+	-- Weather (random rain showers that come and go)
+	ENABLE_WEATHER = true,
+	CLEAR_MIN_TIME = 90,           -- seconds of dry weather between showers (random min/max)
+	CLEAR_MAX_TIME = 240,
+	RAIN_MIN_TIME = 60,            -- how long a shower lasts (random min/max)
+	RAIN_MAX_TIME = 180,
+	RAIN_MIN_INTENSITY = 0.4,      -- each shower picks a strength between this and 1
+	RAIN_FADE_TIME = 12,           -- seconds to fade a shower in or out
+	FIRST_RAIN_MIN = 10,           -- the first shower after you run the script starts after this many seconds (random min/max)
+	FIRST_RAIN_MAX = 25,
+	RAIN_STREAKS = 70,             -- rain streaks drawn on screen at full intensity (needs no assets)
+	RAIN_PARTICLES = false,        -- optional 3D particle rain (only looks right with a good RAIN_TEXTURE)
+	TEST_BUTTONS = true,           -- on-screen BLEED and STORM buttons (handy on mobile / for testing)
+	RAIN_DARKEN = 0.35,            -- how much rain dims the daylight (0 = none)
+	RAIN_AREA = 70,                -- width of the rain curtain around you (studs)
+	RAIN_HEIGHT = 30,              -- how far above your head the rain starts
+	RAIN_RATE_MAX = 700,           -- raindrops per second at full intensity
+	-- Texture of one raindrop particle. Swap in a streak texture ID for nicer rain.
+	RAIN_TEXTURE = "rbxasset://textures/particles/sparkles_main.dds",
+	SHELTER_CHECK_HEIGHT = 80,     -- a solid, collidable roof within this height above you counts as shelter
+	SCREEN_DROP_POOL = 28,         -- max water/blood drops on the screen at once
+	RAIN_DROP_RATE = 7,            -- new water drops per second at full rain (outdoors)
+	-- Looped rain sound + thunder: the first ID in each list that loads is used.
+	-- Nothing plays until you paste working rbxassetid:// IDs here (rain still looks fine).
+	RAIN_SOUND_IDS = {
+		-- "rbxassetid://YOUR_RAIN_LOOP_ID",
+	},
+	THUNDER_SOUND_IDS = {
+		-- "rbxassetid://YOUR_THUNDER_ID",
+	},
+	RAIN_MAX_VOLUME = 0.6,
+	RAIN_INDOOR_MUFFLE = 22,       -- how much the rain is dulled under a roof (dB cut on highs)
+	THUNDER_VOLUME = 1,
+	-- Puddle splash for wet-ground footsteps. One ID, ideally a single splashy step.
+	PUDDLE_SOUND_ID = "",          -- e.g. "rbxassetid://YOUR_PUDDLE_STEP_ID"
+	PUDDLE_STEPS_IN_FILE = 1,      -- raise if the clip contains several steps (see footsteps below)
+	-- Lightning (only in heavy rain)
+	ENABLE_LIGHTNING = true,
+	LIGHTNING_MIN_RAIN = 0.75,     -- rain strength needed before lightning can strike
+	LIGHTNING_MIN_GAP = 8,         -- seconds between strikes (random min/max)
+	LIGHTNING_MAX_GAP = 25,
+	LIGHTNING_EXPOSURE = 3,        -- how blown-out the screen gets at the flash peak
 
 	-- Sun Glare
 	SUN_GLARE_COS_START = 0.88,
@@ -218,7 +271,7 @@ local CONFIG = {
 		-- "rbxassetid://YOUR_EAR_RINGING_LOOP_ID",
 		"rbxasset://sounds/electronicpingshort.wav", -- built-in placeholder; put a real tinnitus loop above it
 	},
-	DEBUG_KEYS = true,             -- G = pass out right now, H = empty hunger + thirst (for testing)
+	DEBUG_KEYS = true,             -- G = pass out, H = empty hunger + thirst, J = start bleeding, K = toggle storm
 	BREATH_MAX_VOLUME = 0.8,
 	HEARTBEAT_MAX_VOLUME = 0.9,
 	RING_MAX_VOLUME = 0.7,
@@ -278,11 +331,17 @@ local CONFIG = {
 	SPRINT_COLOR = Color3.fromRGB(80, 220, 120),
 	STRENGTH_COLOR = Color3.fromRGB(170, 110, 235),
 	ADRENALINE_COLOR = Color3.fromRGB(240, 220, 70),
+	BLEED_COLOR = Color3.fromRGB(150, 20, 35),
+	BANDAGE_COLOR = Color3.fromRGB(235, 232, 220),
 }
 
 --------------------------------------------------------------------------------
 -- STATE VARIABLES
 --------------------------------------------------------------------------------
+local function randRange(a, b)
+	return a + math.random() * (b - a)
+end
+
 local adrenaline = 0
 local stamina = CONFIG.MAX_STAMINA
 local exhausted = false
@@ -320,6 +379,7 @@ local faintTimer = 0         -- seconds walked while exhausted
 local faintThreshold = nil   -- random seconds before you pass out
 local deadHandled = false
 local footstepPool, footstepIndex = {}, 0
+local puddlePool, puddleIndex = {}, 0
 local breathSound, heartSound, ringSound, thumpSound = nil, nil, nil, nil
 local stepTimer, stepRate = 0, 2
 local defaultRunning, defaultRunningVolume = nil, nil
@@ -328,6 +388,31 @@ local soundGen = 0
 
 local ragdollData = nil      -- declared up here so the render-step closure can see it
 local ragdollCamCF = nil
+
+-- Bleeding
+local bleedSeverity = 0      -- 0 = not bleeding, 1 = worst bleed
+local bandaging = false
+local bandageStart = 0
+local bandageToken = 0       -- bumped to cancel an in-progress bandage
+
+-- Weather (everything in one table)
+local weather = {
+	rain = 0,                -- current rain strength 0..1 (fades toward target)
+	target = 0,
+	timer = randRange(CONFIG.FIRST_RAIN_MIN, CONFIG.FIRST_RAIN_MAX), -- seconds until the first shower
+	sheltered = 0,           -- 0 = open sky above you, 1 = roof overhead
+	shelterTarget = 0,
+	shelterTimer = 0,
+	wet = 0,                 -- how soaked the ground is 0..1
+	flash = 0,               -- current lightning brightness 0..1
+	lightning = nil,         -- active strike state, nil when idle
+	lightningTimer = randRange(CONFIG.LIGHTNING_MIN_GAP, CONFIG.LIGHTNING_MAX_GAP),
+	rainSound = nil,
+	rainEQ = nil,
+	thunderSound = nil,
+	part = nil,              -- invisible part that follows the camera and emits rain
+	emitter = nil,
+}
 
 --------------------------------------------------------------------------------
 -- RAYCAST HELPER (skips invisible parts so they don't block sight/sun)
@@ -519,7 +604,7 @@ local function setupFirstPersonAndBobbing(character)
 end
 
 --------------------------------------------------------------------------------
--- 2. CLIENT-SIDED GEAR CREATION (WATER BOTTLE & FOOD BAR)
+-- 2. CLIENT-SIDED GEAR CREATION (WATER BOTTLE, FOOD BAR & BANDAGE)
 --------------------------------------------------------------------------------
 local UPRIGHT = CFrame.Angles(0, 0, math.pi / 2) -- stands a cylinder (axis X) up along Y
 
@@ -669,6 +754,34 @@ local function buildFoodBar()
 	return tool
 end
 
+local function buildBandage()
+	local tool = Instance.new("Tool")
+	tool.Name = "Bandage"
+	tool.RequiresHandle = true
+	tool.CanBeDropped = false
+	tool.ToolTip = "Hold to stop bleeding"
+
+	-- Invisible grip block; the roll is welded to it
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(0.5, 0.9, 0.5)
+	handle.Transparency = 1
+	handle.CanCollide = false
+	handle.Massless = true
+	handle.Parent = tool
+
+	local gauze = Color3.fromRGB(238, 234, 222)
+	cyl(tool, handle, "Roll", 0, 0.6, 0.9, gauze, Enum.Material.Fabric, 0)
+	cyl(tool, handle, "RollCore", 0, 0.64, 0.28, Color3.fromRGB(150, 130, 100), Enum.Material.SmoothPlastic, 0)
+	cyl(tool, handle, "RollStripe", 0, 0.12, 0.92, Color3.fromRGB(190, 40, 40), Enum.Material.Fabric, 0)
+
+	-- Loose end hanging off the side of the roll
+	addVisual(tool, handle, "Tail", Enum.PartType.Block, Vector3.new(0.03, 0.5, 0.4),
+		CFrame.new(0.46, -0.3, 0), gauze, Enum.Material.Fabric, 0)
+
+	return tool
+end
+
 -- Plain fallback tool so you always get your gear even if the detailed model fails
 local function simpleTool(name, tip, color)
 	local tool = Instance.new("Tool")
@@ -695,6 +808,8 @@ local function safeBuild(builder, name, tip, color)
 	return simpleTool(name, tip, color)
 end
 
+local GEAR_NAMES = { ["Water Bottle"] = true, ["Food Bar"] = true, ["Bandage"] = true }
+
 local function createClientGears()
 	task.wait(0.25) -- let the new Backpack exist after a respawn
 	local backpack = LocalPlayer:WaitForChild("Backpack")
@@ -707,7 +822,7 @@ local function createClientGears()
 	for _, folder in ipairs({ backpack, LocalPlayer.Character }) do
 		if folder then
 			for _, item in ipairs(folder:GetChildren()) do
-				if item.Name == "Water Bottle" or item.Name == "Food Bar" then
+				if GEAR_NAMES[item.Name] then
 					item:Destroy()
 				end
 			end
@@ -731,6 +846,27 @@ local function createClientGears()
 		hunger = math.clamp(hunger + CONFIG.FOOD_REFILL_AMOUNT, 0, 100)
 	end)
 	foodTool.Parent = backpack
+
+	-- Bandage: click to start wrapping; keep it equipped until the bar empties.
+	-- Unequipping mid-wrap cancels it and the bleeding continues.
+	local bandageTool = safeBuild(buildBandage, "Bandage", "Hold to stop bleeding", Color3.fromRGB(238, 234, 222))
+	bandageTool.Activated:Connect(function()
+		if bandaging or bleedSeverity <= 0 then return end
+		bandaging = true
+		bandageStart = os.clock()
+		bandageToken = bandageToken + 1
+		local token = bandageToken
+		task.delay(CONFIG.BANDAGE_USE_TIME, function()
+			if token ~= bandageToken or not bandaging then return end
+			bandaging = false
+			bleedSeverity = 0
+		end)
+	end)
+	bandageTool.Unequipped:Connect(function()
+		bandageToken = bandageToken + 1
+		bandaging = false
+	end)
+	bandageTool.Parent = backpack
 end
 
 --------------------------------------------------------------------------------
@@ -827,6 +963,68 @@ local dof = shaders.dof
 local atmosphere = shaders.atmosphere
 
 --------------------------------------------------------------------------------
+-- 3b. ON-SCREEN NOTICES & QUICK ACTIONS
+--------------------------------------------------------------------------------
+local noticeLabel
+do
+	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+	local existing = playerGui:FindFirstChild("RealismNotice")
+	if existing then existing:Destroy() end
+
+	local gui = trackInstance(Instance.new("ScreenGui"))
+	gui.Name = "RealismNotice"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 500
+	gui.Parent = playerGui
+
+	noticeLabel = Instance.new("TextLabel")
+	noticeLabel.AnchorPoint = Vector2.new(0.5, 0)
+	noticeLabel.Position = UDim2.new(0.5, 0, 0.12, 0)
+	noticeLabel.Size = UDim2.new(0.8, 0, 0, 30)
+	noticeLabel.BackgroundTransparency = 1
+	noticeLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	noticeLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+	noticeLabel.TextTransparency = 1
+	noticeLabel.TextStrokeTransparency = 1
+	noticeLabel.Font = Enum.Font.GothamBold
+	noticeLabel.TextSize = 18
+	noticeLabel.Text = ""
+	noticeLabel.Parent = gui
+end
+
+local noticeToken = 0
+local function showNotice(text)
+	noticeToken = noticeToken + 1
+	local token = noticeToken
+	noticeLabel.Text = text
+	noticeLabel.TextTransparency = 0
+	noticeLabel.TextStrokeTransparency = 0.4
+	task.delay(3.5, function()
+		if token ~= noticeToken then return end
+		noticeLabel.TextTransparency = 1
+		noticeLabel.TextStrokeTransparency = 1
+	end)
+end
+
+local function toggleStorm()
+	if weather.target > 0 then
+		weather.target = 0
+		showNotice("The rain is clearing")
+	else
+		weather.target = 1
+		weather.lightningTimer = math.min(weather.lightningTimer, 3)
+		showNotice("A storm is rolling in")
+	end
+	weather.timer = 120 -- hold it for a while before the schedule takes over
+end
+
+local function forceBleed()
+	bleedSeverity = 0.7
+	showNotice("You're bleeding - equip the Bandage and click")
+end
+
+--------------------------------------------------------------------------------
 -- 4. GUI CREATION (BOTTOM RIGHT HUD)
 --------------------------------------------------------------------------------
 local function createHUD()
@@ -842,8 +1040,8 @@ local function createHUD()
 
 	local hudContainer = Instance.new("Frame")
 	hudContainer.Name = "HUDContainer"
-	hudContainer.Size = UDim2.new(0, 220, 0, 140)
-	hudContainer.Position = UDim2.new(1, -240, 1, -160)
+	hudContainer.Size = UDim2.new(0, 220, 0, 170)
+	hudContainer.Position = UDim2.new(1, -240, 1, -190)
 	hudContainer.BackgroundTransparency = 1
 	hudContainer.Parent = screenGui
 
@@ -898,15 +1096,17 @@ local function createHUD()
 	local sprintFill = makeBar("Sprint", CONFIG.SPRINT_COLOR, 4)
 	local adrenalineFill, adrenalineBG = makeBar("Adrenaline", CONFIG.ADRENALINE_COLOR, 5)
 	local strengthFill = makeBar("Leg Strength", CONFIG.STRENGTH_COLOR, 6)
+	local bleedFill, bleedBG = makeBar("Bleeding", CONFIG.BLEED_COLOR, 7)
 
 	adrenalineBG.Visible = false
+	bleedBG.Visible = false
 
 	-- Mobile touch sprint button (hold to run)
 	if UserInputService.TouchEnabled then
 		local mobileBtn = Instance.new("TextButton")
 		mobileBtn.Name = "MobileSprintButton"
 		mobileBtn.Size = UDim2.new(0, 65, 0, 65)
-		mobileBtn.Position = UDim2.new(1, -95, 1, -245)
+		mobileBtn.Position = UDim2.new(1, -95, 1, -275)
 		mobileBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
 		mobileBtn.BackgroundTransparency = 0.3
 		mobileBtn.Text = "RUN"
@@ -950,6 +1150,30 @@ local function createHUD()
 		end))
 	end
 
+	if CONFIG.TEST_BUTTONS then
+		local function testButton(text, y, onClick)
+			local b = Instance.new("TextButton")
+			b.Name = "Test" .. text
+			b.Size = UDim2.new(0, 80, 0, 30)
+			b.Position = UDim2.new(0, 10, 0, y)
+			b.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+			b.BackgroundTransparency = 0.3
+			b.Text = text
+			b.TextColor3 = Color3.fromRGB(255, 255, 255)
+			b.Font = Enum.Font.GothamBold
+			b.TextSize = 12
+			b.Parent = screenGui
+
+			local c = Instance.new("UICorner")
+			c.CornerRadius = UDim.new(0, 6)
+			c.Parent = b
+
+			b.Activated:Connect(onClick)
+		end
+		testButton("BLEED", 70, forceBleed)
+		testButton("STORM", 106, toggleStorm)
+	end
+
 	return {
 		Health = healthFill,
 		Hunger = hungerFill,
@@ -958,6 +1182,8 @@ local function createHUD()
 		Strength = strengthFill,
 		Adrenaline = adrenalineFill,
 		AdrenalineBG = adrenalineBG,
+		Bleeding = bleedFill,
+		BleedingBG = bleedBG,
 	}
 end
 
@@ -1149,15 +1375,24 @@ local function updateTimeOfDayLighting()
 	local sunHeight = Lighting:GetSunDirection().Y
 	local day = math.clamp((sunHeight + 0.1) / 0.4, 0, 1)
 	local golden = 1 - math.clamp(math.abs(sunHeight) / 0.3, 0, 1)
+	local rain = weather.rain
 
 	local skyColor = Color3.fromRGB(45, 55, 85):Lerp(Color3.fromRGB(195, 210, 230), day):Lerp(Color3.fromRGB(255, 185, 130), golden * 0.7)
 	local skyDecay = Color3.fromRGB(25, 28, 50):Lerp(Color3.fromRGB(110, 125, 140), day):Lerp(Color3.fromRGB(200, 110, 70), golden * 0.7)
 
+	-- Rain: grey, heavy sky
+	if rain > 0 then
+		local grey = Color3.fromRGB(125, 132, 145):Lerp(Color3.fromRGB(30, 34, 46), 1 - day)
+		skyColor = skyColor:Lerp(grey, rain * 0.65)
+		skyDecay = skyDecay:Lerp(grey:Lerp(Color3.new(0, 0, 0), 0.35), rain * 0.5)
+	end
+
 	atmosphere.Color = skyColor
 	atmosphere.Decay = skyDecay
-	atmosphere.Density = 0.3 + golden * 0.1 + (1 - day) * 0.05
+	atmosphere.Density = 0.3 + golden * 0.1 + (1 - day) * 0.05 + rain * 0.18
+	atmosphere.Haze = 2.1 + rain * 3
 
-	Lighting.Brightness = CONFIG.MOON_BRIGHTNESS + day * (CONFIG.SUN_BRIGHTNESS - CONFIG.MOON_BRIGHTNESS)
+	Lighting.Brightness = (CONFIG.MOON_BRIGHTNESS + day * (CONFIG.SUN_BRIGHTNESS - CONFIG.MOON_BRIGHTNESS)) * (1 - rain * CONFIG.RAIN_DARKEN)
 	Lighting.OutdoorAmbient = CONFIG.MOON_AMBIENT:Lerp(Color3.fromRGB(110, 115, 125), day):Lerp(Color3.fromRGB(150, 110, 90), golden * 0.4)
 
 	Lighting.ColorShift_Top = Color3.new(0, 0, 0):Lerp(CONFIG.MOON_TINT, 1 - day)
@@ -1166,7 +1401,7 @@ local function updateTimeOfDayLighting()
 end
 
 --------------------------------------------------------------------------------
--- 6b. AUDIO (FOOTSTEPS, BREATHING, HEARTBEAT, EAR RINGING)
+-- 6b. AUDIO (FOOTSTEPS, BREATHING, HEARTBEAT, EAR RINGING, RAIN)
 --------------------------------------------------------------------------------
 local function makeSound(parent, name, id, looped)
 	if not id or id == "" then return nil end
@@ -1181,9 +1416,11 @@ local function makeSound(parent, name, id, looped)
 end
 
 -- Tries each ID in order and keeps the first one that actually loads
-local function loadFirstWorking(parent, name, ids)
+-- (looped defaults to true; pass false for one-shot sounds like thunder)
+local function loadFirstWorking(parent, name, ids, looped)
+	local loop = looped ~= false
 	for _, id in ipairs(ids) do
-		local candidate = makeSound(parent, name, id, true)
+		local candidate = makeSound(parent, name, id, loop)
 		if candidate then
 			pcall(function() ContentProvider:PreloadAsync({ candidate }) end)
 			if candidate.TimeLength > 0 then
@@ -1200,7 +1437,10 @@ local function destroyLoopSounds()
 	if heartSound then heartSound:Destroy() end
 	if ringSound then ringSound:Destroy() end
 	if thumpSound then thumpSound:Destroy() end
+	if weather.rainSound then weather.rainSound:Destroy() end
+	if weather.thunderSound then weather.thunderSound:Destroy() end
 	breathSound, heartSound, ringSound, thumpSound = nil, nil, nil, nil
+	weather.rainSound, weather.rainEQ, weather.thunderSound = nil, nil, nil
 end
 
 local function setupSounds(character)
@@ -1218,6 +1458,17 @@ local function setupSounds(character)
 	end
 	pcall(function() ContentProvider:PreloadAsync(footstepPool) end) -- so TimeLength is known
 	if gen ~= soundGen then return end
+
+	-- Puddle splashes for wet ground (only if you set CONFIG.PUDDLE_SOUND_ID)
+	puddlePool, puddleIndex = {}, 0
+	for i = 1, 2 do
+		local s = makeSound(hrp, "RealismPuddle" .. i, CONFIG.PUDDLE_SOUND_ID, false)
+		if s then table.insert(puddlePool, s) end
+	end
+	if #puddlePool > 0 then
+		pcall(function() ContentProvider:PreloadAsync(puddlePool) end)
+		if gen ~= soundGen then return end
+	end
 
 	-- Breathing is positional (comes from your body); heartbeat and ringing are
 	-- parented to PlayerGui so they play "inside your head" at full volume.
@@ -1265,6 +1516,27 @@ local function setupSounds(character)
 		warn("[Realism] No ear ringing sound loaded. Put a working rbxassetid:// ID in CONFIG.RING_SOUND_IDS.")
 	end
 
+	-- Rain loop (with a low-pass filter so it sounds muffled indoors) and thunder.
+	-- Both are optional: with empty ID lists the rain still shows, it just has no sound.
+	local rain = loadFirstWorking(playerGui, "RealismRain", CONFIG.RAIN_SOUND_IDS)
+	if gen ~= soundGen then
+		if rain then rain:Destroy() end
+		return
+	end
+	weather.rainSound = rain
+	if rain then
+		local eq = Instance.new("EqualizerSoundEffect")
+		eq.Parent = rain
+		weather.rainEQ = eq
+	end
+
+	local thunder = loadFirstWorking(playerGui, "RealismThunder", CONFIG.THUNDER_SOUND_IDS, false)
+	if gen ~= soundGen then
+		if thunder then thunder:Destroy() end
+		return
+	end
+	weather.thunderSound = thunder
+
 	defaultRunning, defaultRunningVolume = nil, nil
 	if CONFIG.MUTE_DEFAULT_FOOTSTEPS then
 		local running = hrp:WaitForChild("Running", 3)
@@ -1275,8 +1547,13 @@ local function setupSounds(character)
 	end
 end
 
-local function playFootstep(sound, humanoid, isRunning, speedT)
-	local id = CONFIG.MATERIAL_SOUNDS[humanoid.FloorMaterial] or CONFIG.FOOTSTEP_DEFAULT_ID
+local function playFootstep(sound, humanoid, isRunning, speedT, puddle)
+	local id
+	if puddle then
+		id = CONFIG.PUDDLE_SOUND_ID
+	else
+		id = CONFIG.MATERIAL_SOUNDS[humanoid.FloorMaterial] or CONFIG.FOOTSTEP_DEFAULT_ID
+	end
 	if sound.SoundId ~= id then sound.SoundId = id end
 	sound.PlaybackSpeed = (isRunning and 1.2 or 0.95) + math.random() * 0.15 + speedT * 0.2
 	sound.Volume = isRunning and 0.85 or 0.45
@@ -1284,9 +1561,10 @@ local function playFootstep(sound, humanoid, isRunning, speedT)
 	sound:Play()
 
 	-- The default file holds several steps; cut it off after the first one
+	local steps = puddle and CONFIG.PUDDLE_STEPS_IN_FILE or CONFIG.FOOTSTEP_STEPS_IN_FILE
 	local clip = CONFIG.FOOTSTEP_CLIP_LENGTH
-	if clip <= 0 and CONFIG.FOOTSTEP_STEPS_IN_FILE > 1 and sound.TimeLength > 0 then
-		clip = sound.TimeLength / CONFIG.FOOTSTEP_STEPS_IN_FILE
+	if clip <= 0 and steps > 1 and sound.TimeLength > 0 then
+		clip = sound.TimeLength / steps
 	end
 	if clip > 0 then
 		task.delay(clip / math.max(sound.PlaybackSpeed, 0.1), function()
@@ -1331,8 +1609,15 @@ local function updateAudio(deltaTime, humanoid, flatSpeed, healthPercent)
 		stepTimer = stepTimer + deltaTime
 		if stepTimer >= 1 / stepRate then
 			stepTimer = 0
-			footstepIndex = footstepIndex % #footstepPool + 1
-			playFootstep(footstepPool[footstepIndex], humanoid, isRunning, speedT)
+			-- Wet ground (outdoors) swaps in puddle splashes
+			local puddleChance = weather.wet * (1 - weather.sheltered * 0.8)
+			if #puddlePool > 0 and math.random() < puddleChance then
+				puddleIndex = puddleIndex % #puddlePool + 1
+				playFootstep(puddlePool[puddleIndex], humanoid, isRunning, speedT, true)
+			else
+				footstepIndex = footstepIndex % #footstepPool + 1
+				playFootstep(footstepPool[footstepIndex], humanoid, isRunning, speedT, false)
+			end
 			-- Each step while limping dips the camera a little
 			if limpFactor > 0 then
 				landingVelocity = landingVelocity - 1.2 * limpFactor
@@ -1355,9 +1640,9 @@ local function updateAudio(deltaTime, humanoid, flatSpeed, healthPercent)
 		breathSound.PlaybackSpeed = 0.9 + factor * 0.4
 	end
 
-	-- Heartbeat: low health, out of sprint, and a little with adrenaline
+	-- Heartbeat: low health, out of sprint, bleeding, and a little with adrenaline
 	local lowHealth = math.clamp((0.4 - healthPercent) / 0.4, 0, 1)
-	local heartFactor = math.max(lowHealth, depleted, (adrenaline / 100) * 0.35)
+	local heartFactor = math.max(lowHealth, depleted, (adrenaline / 100) * 0.35, bleedSeverity * 0.4)
 	if heartSound then
 		approachVolume(heartSound, heartFactor * CONFIG.HEARTBEAT_MAX_VOLUME, deltaTime, 3)
 		heartSound.PlaybackSpeed = 0.9 + heartFactor * 0.5
@@ -1366,6 +1651,15 @@ local function updateAudio(deltaTime, humanoid, flatSpeed, healthPercent)
 	-- Ear ringing: builds as sprint runs out
 	if ringSound then
 		approachVolume(ringSound, depleted * CONFIG.RING_MAX_VOLUME, deltaTime, 3)
+	end
+
+	-- Rain ambience: quieter and duller when there's a roof over you
+	if weather.rainSound then
+		local target = weather.rain * CONFIG.RAIN_MAX_VOLUME * (1 - weather.sheltered * 0.55)
+		approachVolume(weather.rainSound, target, deltaTime, 3)
+		if weather.rainEQ then
+			weather.rainEQ.HighGain = -weather.sheltered * CONFIG.RAIN_INDOOR_MUFFLE
+		end
 	end
 
 	-- Camera thump on every heartbeat (lub-dub), works even with no sound loaded
@@ -1680,6 +1974,335 @@ local function updateMantle(deltaTime, humanoid, hrp, character)
 end
 
 --------------------------------------------------------------------------------
+-- 6e. BLEEDING
+--------------------------------------------------------------------------------
+-- Called whenever you lose health in one hit. Bigger hits are more likely to make
+-- you bleed, and bleed harder. Starvation and bleeding itself never call this.
+local function tryStartBleed(damage, maxHealth)
+	local fraction = damage / math.max(maxHealth, 1)
+	if fraction < CONFIG.BLEED_HIT_FRACTION then return end
+
+	local chance = math.clamp(0.5 + (fraction - CONFIG.BLEED_HIT_FRACTION) * 2.3, 0.5, 1)
+	if math.random() > chance then return end
+
+	local wasBleeding = bleedSeverity > 0
+	bleedSeverity = math.clamp(bleedSeverity + 0.3 + fraction * 0.8, 0, 1)
+	if not wasBleeding then
+		showNotice("You're bleeding - equip the Bandage and click")
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 6f. SCREEN DROPS (rain water + blood), RAIN, LIGHTNING & WEATHER
+--------------------------------------------------------------------------------
+local screenDrops = {}
+
+local function createScreenDrops()
+	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+	local existing = playerGui:FindFirstChild("RealismScreenDrops")
+	if existing then existing:Destroy() end
+
+	local gui = trackInstance(Instance.new("ScreenGui"))
+	gui.Name = "RealismScreenDrops"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = -3
+	gui.Parent = playerGui
+
+	for _ = 1, CONFIG.SCREEN_DROP_POOL do
+		local frame = Instance.new("Frame")
+		frame.AnchorPoint = Vector2.new(0.5, 0.5)
+		frame.BackgroundTransparency = 1
+		frame.BorderSizePixel = 0
+		frame.Visible = false
+		frame.Parent = gui
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(1, 0)
+		corner.Parent = frame
+
+		local stroke = Instance.new("UIStroke")
+		stroke.Thickness = 1
+		stroke.Transparency = 1
+		stroke.Parent = frame
+
+		table.insert(screenDrops, {
+			frame = frame, stroke = stroke,
+			active = false, blood = false,
+			age = 0, life = 1, x = 0, y = 0, vy = 0,
+		})
+	end
+end
+
+createScreenDrops()
+
+-- Rain streaks drawn straight on the screen: plain white lines, so no assets are needed
+local rainStreaks = {}
+
+local function createRainStreaks()
+	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+	local existing = playerGui:FindFirstChild("RealismRainStreaks")
+	if existing then existing:Destroy() end
+
+	local gui = trackInstance(Instance.new("ScreenGui"))
+	gui.Name = "RealismRainStreaks"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = -4
+	gui.Parent = playerGui
+
+	for _ = 1, CONFIG.RAIN_STREAKS do
+		local frame = Instance.new("Frame")
+		frame.AnchorPoint = Vector2.new(0.5, 0.5)
+		frame.Size = UDim2.fromOffset(2, 30 + math.random() * 35)
+		frame.Rotation = 12
+		frame.BackgroundColor3 = Color3.fromRGB(205, 220, 240)
+		frame.BackgroundTransparency = 0.65
+		frame.BorderSizePixel = 0
+		frame.Visible = false
+		frame.Parent = gui
+
+		table.insert(rainStreaks, {
+			frame = frame,
+			x = math.random() * 1.2,
+			y = math.random() * 1.2 - 0.1,
+			speed = 1.1 + math.random() * 0.8, -- screen heights per second
+		})
+	end
+end
+
+createRainStreaks()
+
+local function updateRainStreaks(dt)
+	local amount = weather.rain * (1 - weather.sheltered * 0.9)
+	local visibleCount = math.floor(amount * #rainStreaks + 0.5)
+	local view = Camera.ViewportSize
+	local aspect = view.Y / math.max(view.X, 1)
+
+	for i, s in ipairs(rainStreaks) do
+		local show = i <= visibleCount
+		if show then
+			s.y = s.y + s.speed * dt
+			s.x = s.x - s.speed * 0.21 * aspect * dt -- falls slightly to the left
+			if s.y > 1.1 or s.x < -0.1 then
+				s.y = -0.1
+				s.x = math.random() * 1.2
+			end
+			s.frame.Position = UDim2.fromScale(s.x, s.y)
+		end
+		if s.frame.Visible ~= show then s.frame.Visible = show end
+	end
+end
+
+local function spawnScreenDrop(blood)
+	for _, d in ipairs(screenDrops) do
+		if not d.active then
+			d.active = true
+			d.blood = blood
+			d.age = 0
+			d.life = (blood and 3.5 or 2.5) + math.random() * 2.5
+			d.x = 0.05 + math.random() * 0.9
+			d.y = math.random() * 0.75
+			d.vy = blood and (0.03 + math.random() * 0.04) or (0.01 + math.random() * 0.03)
+			local size = (blood and 10 or 6) + math.random() * (blood and 14 or 12)
+			d.frame.Size = UDim2.fromOffset(size, size * (blood and 1.3 or 1))
+			d.frame.BackgroundColor3 = blood and Color3.fromRGB(110, 10, 10) or Color3.fromRGB(200, 220, 240)
+			d.stroke.Color = blood and Color3.fromRGB(70, 0, 0) or WHITE
+			d.frame.Visible = true
+			return
+		end
+	end
+end
+
+local function clearScreenDrops()
+	for _, d in ipairs(screenDrops) do
+		d.active = false
+		d.frame.Visible = false
+	end
+end
+
+local function updateScreenDrops(dt)
+	updateRainStreaks(dt)
+
+	-- Water drops land on the "lens" in the open; blood drips while you bleed
+	local rainRate = weather.rain * (1 - weather.sheltered * 0.9) * CONFIG.RAIN_DROP_RATE
+	if math.random() < rainRate * dt then spawnScreenDrop(false) end
+	if bleedSeverity > 0 and math.random() < bleedSeverity * CONFIG.BLOOD_DROP_RATE * dt then
+		spawnScreenDrop(true)
+	end
+
+	for _, d in ipairs(screenDrops) do
+		if d.active then
+			d.age = d.age + dt
+			local a = d.age / d.life
+			if a >= 1 or d.y > 1.05 then
+				d.active = false
+				d.frame.Visible = false
+			else
+				-- Drops creep down the screen, speeding up as they get heavy
+				d.y = d.y + d.vy * dt * (0.5 + a)
+				local fade = 1
+				if a < 0.1 then fade = a / 0.1 elseif a > 0.6 then fade = (1 - a) / 0.4 end
+				local opacity = fade * (d.blood and 0.85 or 0.4)
+				d.frame.Position = UDim2.fromScale(d.x, d.y)
+				d.frame.BackgroundTransparency = 1 - opacity
+				d.stroke.Transparency = 1 - fade * 0.5
+			end
+		end
+	end
+end
+
+-- Invisible part that follows your camera and rains down on you
+local function setupRain()
+	local part = trackInstance(Instance.new("Part"))
+	part.Name = "RealismRain"
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.Transparency = 1
+	part.Size = Vector3.new(CONFIG.RAIN_AREA, 1, CONFIG.RAIN_AREA)
+	part.Parent = Workspace
+
+	local emitter = Instance.new("ParticleEmitter")
+	emitter.Name = "Rain"
+	emitter.Texture = CONFIG.RAIN_TEXTURE
+	emitter.Orientation = Enum.ParticleOrientation.VelocityParallel
+	emitter.EmissionDirection = Enum.NormalId.Bottom
+	emitter.Speed = NumberRange.new(75, 90)
+	emitter.Lifetime = NumberRange.new(0.5, 0.6)
+	emitter.Size = NumberSequence.new(0.4)
+	emitter.Transparency = NumberSequence.new(0.55)
+	emitter.Color = ColorSequence.new(Color3.fromRGB(190, 210, 235))
+	emitter.LightEmission = 0.3
+	emitter.LightInfluence = 1
+	emitter.LockedToPart = false
+	emitter.Rate = 0
+	emitter.Parent = part
+
+	weather.part = part
+	weather.emitter = emitter
+end
+
+if CONFIG.RAIN_PARTICLES then setupRain() end
+
+-- Triangle-shaped brightness pulse: rises from start to peak, falls to finish
+local function pulse(t, start, peak, finish, amp)
+	if t <= start or t >= finish then return 0 end
+	if t < peak then return amp * (t - start) / (peak - start) end
+	return amp * (finish - t) / (finish - peak)
+end
+
+-- Random strikes during heavy rain: a double flash, then thunder after a delay
+local function updateLightning(dt)
+	local w = weather
+	local stormy = CONFIG.ENABLE_LIGHTNING and w.rain >= CONFIG.LIGHTNING_MIN_RAIN
+
+	if stormy and not w.lightning then
+		w.lightningTimer = w.lightningTimer - dt
+		if w.lightningTimer <= 0 then
+			w.lightning = { t = 0, thunderAt = 0.4 + math.random() * 3.5, thundered = false }
+			w.lightningTimer = randRange(CONFIG.LIGHTNING_MIN_GAP, CONFIG.LIGHTNING_MAX_GAP)
+		end
+	end
+
+	local flash = 0
+	local strike = w.lightning
+	if strike then
+		strike.t = strike.t + dt
+		local t = strike.t
+		flash = math.max(pulse(t, 0, 0.05, 0.28, 1), pulse(t, 0.22, 0.3, 0.6, 0.65))
+
+		if not strike.thundered and t >= strike.thunderAt then
+			strike.thundered = true
+			if w.thunderSound then
+				w.thunderSound.Volume = CONFIG.THUNDER_VOLUME * (1 - w.sheltered * 0.5)
+				w.thunderSound.PlaybackSpeed = 0.85 + math.random() * 0.3
+				w.thunderSound.TimePosition = 0
+				w.thunderSound:Play()
+			end
+			landingVelocity = landingVelocity - 0.5 -- a little camera rumble
+		end
+
+		if strike.thundered and t > 0.7 then
+			w.lightning = nil
+		end
+	end
+	return flash
+end
+
+-- True if something solid and collidable (not leaves, glass or invisible parts) is overhead
+local function roofAbove(character)
+	local origin = Camera.CFrame.Position
+	local filter = { character }
+	for _ = 1, 6 do
+		sharedRayParams.FilterDescendantsInstances = filter
+		local result = Workspace:Raycast(origin, Vector3.new(0, CONFIG.SHELTER_CHECK_HEIGHT, 0), sharedRayParams)
+		if not result then return false end
+		if result.Instance.CanCollide and result.Instance.Transparency < 0.5 then return true end
+		table.insert(filter, result.Instance)
+	end
+	return false
+end
+
+local function updateWeather(dt, character)
+	local w = weather
+	if not CONFIG.ENABLE_WEATHER then
+		w.rain = 0
+		w.flash = 0
+		if w.emitter then w.emitter.Rate = 0 end
+		return
+	end
+
+	-- Schedule: dry spell -> shower -> dry spell ...
+	w.timer = w.timer - dt
+	if w.timer <= 0 then
+		if w.target > 0 then
+			w.target = 0
+			w.timer = randRange(CONFIG.CLEAR_MIN_TIME, CONFIG.CLEAR_MAX_TIME)
+			showNotice("The rain is clearing")
+		else
+			w.target = randRange(CONFIG.RAIN_MIN_INTENSITY, 1)
+			w.timer = randRange(CONFIG.RAIN_MIN_TIME, CONFIG.RAIN_MAX_TIME)
+			showNotice("It starts to rain")
+		end
+	end
+
+	-- Fade the rain in and out
+	local step = dt / math.max(CONFIG.RAIN_FADE_TIME, 0.1)
+	if w.rain < w.target then
+		w.rain = math.min(w.target, w.rain + step)
+	else
+		w.rain = math.max(w.target, w.rain - step)
+	end
+
+	-- Is there a roof over your head? (throttled)
+	w.shelterTimer = w.shelterTimer + dt
+	if w.shelterTimer >= 0.15 then
+		w.shelterTimer = 0
+		w.shelterTarget = roofAbove(character) and 1 or 0
+	end
+	w.sheltered = w.sheltered + (w.shelterTarget - w.sheltered) * math.clamp(dt * 4, 0, 1)
+
+	-- The ground soaks up rain and dries out slowly afterward
+	if w.rain > 0.15 then
+		w.wet = math.min(1, w.wet + dt * 0.12)
+	else
+		w.wet = math.max(0, w.wet - dt * 0.01)
+	end
+
+	-- Rain curtain follows the camera; nothing falls on you under a roof
+	if w.part and w.emitter then
+		w.part.CFrame = CFrame.new(Camera.CFrame.Position + Vector3.new(0, CONFIG.RAIN_HEIGHT, 0))
+		w.emitter.Rate = w.rain * (1 - w.sheltered) * CONFIG.RAIN_RATE_MAX
+	end
+
+	w.flash = updateLightning(dt)
+end
+
+--------------------------------------------------------------------------------
 -- 7. MAIN UPDATE LOOP
 --------------------------------------------------------------------------------
 local function mainUpdate(deltaTime)
@@ -1707,6 +2330,8 @@ local function mainUpdate(deltaTime)
 		if not deadHandled then
 			deadHandled = true
 			faint = nil
+			bleedSeverity = 0
+			bandaging = false
 			blackAlpha, blackTarget = 1, 1
 			startRagdoll(character)
 		end
@@ -1751,9 +2376,10 @@ local function mainUpdate(deltaTime)
 	end
 	wasAirborne = airborne
 
-	-- A. Health check (damage triggers adrenaline)
+	-- A. Health check (damage triggers adrenaline, and big hits can cause bleeding)
 	if humanoid.Health < lastHealth then
 		adrenaline = 100
+		tryStartBleed(lastHealth - humanoid.Health, humanoid.MaxHealth)
 	end
 	lastHealth = humanoid.Health
 
@@ -1849,6 +2475,13 @@ local function mainUpdate(deltaTime)
 		lastHealth = humanoid.Health -- slow damage shouldn't trigger the adrenaline spike
 	end
 
+	-- E3. Bleeding: steady health drain until a Bandage stops it
+	if bleedSeverity > 0 and humanoid.Health > 0 then
+		local bleedRate = CONFIG.BLEED_DRAIN_MIN + (CONFIG.BLEED_DRAIN_MAX - CONFIG.BLEED_DRAIN_MIN) * bleedSeverity
+		humanoid.Health = math.max(0, humanoid.Health - bleedRate * deltaTime)
+		lastHealth = humanoid.Health -- slow damage shouldn't trigger the adrenaline spike or re-roll bleeding
+	end
+
 	-- F. WalkSpeed & FOV
 	local adrenalinePercent = adrenaline / 100
 	local runSpeed = CONFIG.ADRENALINE_SPEED + (CONFIG.MAX_RUN_SPEED - CONFIG.ADRENALINE_SPEED) * (legStrength / 100)
@@ -1868,23 +2501,35 @@ local function mainUpdate(deltaTime)
 	limpFactor = math.clamp((CONFIG.LIMP_HEALTH_THRESHOLD - hpFraction) / CONFIG.LIMP_HEALTH_THRESHOLD, 0, 1)
 	targetSpeed = targetSpeed * (1 - CONFIG.LIMP_MAX_SLOWDOWN * limpFactor)
 
+	-- Wrapping a bandage slows you down
+	if bandaging then
+		targetSpeed = targetSpeed * CONFIG.BANDAGE_MOVE_MULT
+	end
+
 	humanoid.WalkSpeed = targetSpeed
 	Camera.FieldOfView = Camera.FieldOfView + (targetFOV - Camera.FieldOfView) * math.clamp(deltaTime * 5, 0, 1)
 
-	-- F2. Sun glare
-	local sunTarget = getSunExposure(character)
+	-- F1b. Weather (rain, shelter, lightning) and screen drops (water + blood)
+	safeCall("weather", updateWeather, deltaTime, character)
+	safeCall("screen drops", updateScreenDrops, deltaTime)
+
+	-- F2. Sun glare (clouds hide the sun while it rains)
+	local sunTarget = getSunExposure(character) * (1 - weather.rain * 0.85)
 	local glareRate = sunTarget > sunGlare and CONFIG.SUN_GLARE_RISE or CONFIG.SUN_GLARE_FALL
 	sunGlare = sunGlare + (sunTarget - sunGlare) * math.clamp(deltaTime * glareRate, 0, 1)
 
 	local day, golden = updateTimeOfDayLighting()
 
+	-- Lightning blows out the screen; a roof blocks about half of it
+	local flash = weather.flash * (1 - weather.sheltered * 0.5)
+
 	sunRays.Intensity = 0.18 + sunGlare * CONFIG.SUN_RAYS_MAX
 	sunRays.Spread = 0.85 + sunGlare * 0.15
-	bloom.Intensity = 0.45 + sunGlare * CONFIG.SUN_BLOOM_MAX
+	bloom.Intensity = 0.45 + sunGlare * CONFIG.SUN_BLOOM_MAX + flash * 1.2
 	bloom.Threshold = 0.92 - sunGlare * 0.4
 	bloom.Size = 24 + sunGlare * 40
 	atmosphere.Glare = 0.45 + sunGlare * 1.5
-	Lighting.ExposureCompensation = sunGlare * CONFIG.SUN_EXPOSURE_MAX + (1 - day) * CONFIG.MOON_EXPOSURE
+	Lighting.ExposureCompensation = sunGlare * CONFIG.SUN_EXPOSURE_MAX + (1 - day) * CONFIG.MOON_EXPOSURE + flash * CONFIG.LIGHTNING_EXPOSURE
 
 	-- F3. Color grading
 	local healthPercent = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
@@ -1892,17 +2537,19 @@ local function mainUpdate(deltaTime)
 	injuryVisual = injuryVisual + (injury - injuryVisual) * math.clamp(deltaTime * 4, 0, 1)
 	local blend = math.clamp(deltaTime * 6, 0, 1)
 
-	local targetBrightness = 0.02 + (0.13 * adrenalinePercent) + sunGlare * 0.2
+	local targetBrightness = 0.02 + (0.13 * adrenalinePercent) + sunGlare * 0.2 + flash * 0.2
 	local targetContrast = 0.15 + (0.05 * adrenalinePercent) - sunGlare * 0.1
-	local targetSaturation = 0.1 + (0.1 * adrenalinePercent) - sunGlare * 0.25 - injuryVisual * 0.3 - staminaVisual * 0.15
-	local targetTint = WHITE:Lerp(WARM_TINT, golden * day * 0.5):Lerp(PAIN_TINT, injuryVisual * CONFIG.INJURY_TINT_MAX)
+	local targetSaturation = 0.1 + (0.1 * adrenalinePercent) - sunGlare * 0.25 - injuryVisual * 0.3 - staminaVisual * 0.15 - weather.rain * 0.12
+	local targetTint = WHITE:Lerp(WARM_TINT, golden * day * 0.5 * (1 - weather.rain)):Lerp(PAIN_TINT, injuryVisual * CONFIG.INJURY_TINT_MAX)
 
 	colorCorrection.Brightness = colorCorrection.Brightness + (targetBrightness - colorCorrection.Brightness) * blend
 	colorCorrection.Contrast = colorCorrection.Contrast + (targetContrast - colorCorrection.Contrast) * blend
 	colorCorrection.Saturation = colorCorrection.Saturation + (targetSaturation - colorCorrection.Saturation) * blend
 	colorCorrection.TintColor = colorCorrection.TintColor:Lerp(targetTint, blend)
 
-	local vignetteAlpha = injuryVisual * CONFIG.INJURY_VIGNETTE_MAX
+	-- Red edge glow from injury, with a slow throb while bleeding
+	local bleedThrob = bleedSeverity * 0.15 * (0.5 + 0.5 * math.sin(os.clock() * 3))
+	local vignetteAlpha = math.clamp(injuryVisual * CONFIG.INJURY_VIGNETTE_MAX + bleedThrob, 0, 1)
 	for _, frame in ipairs(damageFrames) do
 		frame.BackgroundTransparency = 1 - vignetteAlpha
 	end
@@ -1934,6 +2581,22 @@ local function mainUpdate(deltaTime)
 		bars.Adrenaline.Size = UDim2.new(adrenaline / 100, 0, 1, 0)
 	else
 		bars.AdrenalineBG.Visible = false
+	end
+
+	-- Bleeding bar: red while bleeding, pale and draining while a bandage is being wrapped
+	if bleedSeverity > 0 then
+		bars.BleedingBG.Visible = true
+		local shown = bleedSeverity
+		if bandaging then
+			local progress = math.clamp((os.clock() - bandageStart) / CONFIG.BANDAGE_USE_TIME, 0, 1)
+			shown = bleedSeverity * (1 - progress)
+			bars.Bleeding.BackgroundColor3 = CONFIG.BANDAGE_COLOR
+		else
+			bars.Bleeding.BackgroundColor3 = CONFIG.BLEED_COLOR
+		end
+		bars.Bleeding.Size = UDim2.new(shown, 0, 1, 0)
+	else
+		bars.BleedingBG.Visible = false
 	end
 
 	-- H. Day / night cycle
@@ -1975,6 +2638,7 @@ local function resetStateForNewCharacter()
 	swayX, swayY = 0, 0
 	lastCamCF = nil
 	footstepPool, footstepIndex = {}, 0
+	puddlePool, puddleIndex = {}, 0
 	destroyLoopSounds()
 	stepTimer = 0
 	heartPhase, heartDubDone = 0, true
@@ -1987,6 +2651,14 @@ local function resetStateForNewCharacter()
 	blackTarget = 0
 	blackRate = 1 / CONFIG.RESPAWN_FADE_IN
 	defaultRunning, defaultRunningVolume = nil, nil
+
+	-- A fresh body: wounds heal, bandage cancelled, screen cleared. Weather carries on.
+	bleedSeverity = 0
+	bandaging = false
+	bandageToken = bandageToken + 1
+	weather.lightning = nil
+	weather.flash = 0
+	clearScreenDrops()
 end
 
 -- Each system starts on its own, so one failing never stops the others
@@ -2005,7 +2677,7 @@ if LocalPlayer.Character then
 	initCharacter(LocalPlayer.Character)
 end
 
--- Test keys: G = pass out right now, H = empty hunger and thirst
+-- Test keys: G = pass out, H = empty hunger and thirst, J = start bleeding, K = toggle a storm
 if CONFIG.DEBUG_KEYS then
 	track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if gameProcessed then return end
@@ -2018,11 +2690,15 @@ if CONFIG.DEBUG_KEYS then
 			safeCall("debug faint", startFaint, char, hum, root)
 		elseif input.KeyCode == Enum.KeyCode.H then
 			hunger, thirst = 0, 0
+		elseif input.KeyCode == Enum.KeyCode.J then
+			forceBleed()
+		elseif input.KeyCode == Enum.KeyCode.K then
+			toggleStorm()
 		end
 	end))
 end
 
-__toast("loaded OK. Press G to test passing out.")
+__toast("loaded OK. G = pass out. Tap the BLEED / STORM buttons (or press J / K) to test.")
 
 --------------------------------------------------------------------------------
 -- CLEANUP (runs automatically if the script is executed again)
@@ -2093,7 +2769,7 @@ _G.RealismCleanup = function()
 	for _, folder in ipairs({ backpack, char }) do
 		if folder then
 			for _, item in ipairs(folder:GetChildren()) do
-				if item.Name == "Water Bottle" or item.Name == "Food Bar" then
+				if GEAR_NAMES[item.Name] then
 					item:Destroy()
 				end
 			end
