@@ -8,6 +8,7 @@
 -- v6: WATER (terrain water look, splashes, ripples, wake, underwater)
 -- v5: SKY (twilight palette, stars, sun/moon size, clouds, storm clouds)
 -- v4 stance fix: real leg geometry, torso leans about the hips, camera follows the real head
+-- v8: EYES (blinking, squinting at the sun), lightning-squircle test menu (all test buttons live in it now)
 
 local __toasts = 0
 local function __toast(text)
@@ -272,7 +273,7 @@ local CONFIG = {
 	RAIN_LENGTH = 4,               -- length of each streak (studs)
 	RAIN_SLANT = -0.12,            -- wind slant (negative = blows left, 0 = straight down)
 	RAIN_PARTICLES = false,        -- optional 3D particle rain (only looks right with a good RAIN_TEXTURE)
-	TEST_BUTTONS = true,           -- on-screen BLEED and STORM buttons (handy on mobile / for testing)
+	TEST_BUTTONS = true,           -- the lightning squircle that opens the test menu (BLEED, STORM, NIGHT, NOON, FALL, BLINK)
 	RAIN_DARKEN = 0.35,            -- how much rain dims the daylight (0 = none)
 	RAIN_AREA = 70,                -- width of the rain curtain around you (studs)
 	RAIN_HEIGHT = 30,              -- how far above your head the rain starts
@@ -349,12 +350,12 @@ local CONFIG = {
 		"rbxassetid://1212068412",
 	},
 	HEARTBEAT_SOUND_IDS = {
-		-- "rbxassetid://139826397745716",
+		"rbxassetid://139826397745716",
 	},
 	-- Used when no heartbeat loop above loads: a built-in thump played on every beat
 	HEARTBEAT_FALLBACK_ID = "rbxasset://sounds/bass.wav",
 	RING_SOUND_IDS = {
-		-- "rbxassetid://9069161602",
+		"rbxassetid://9069161602",
 		"rbxasset://sounds/electronicpingshort.wav", -- built-in placeholder; put a real tinnitus loop above it
 	},
 	DEBUG_KEYS = true,             -- G = pass out, H = empty hunger + thirst, J = start bleeding, K = toggle storm
@@ -561,6 +562,136 @@ if randRange(0, 1) < CONFIG.START_RAINING_CHANCE then
 	weather.wet = 0.5
 	weather.timer = randRange(CONFIG.RAIN_MIN_TIME, CONFIG.RAIN_MAX_TIME)
 end
+
+--------------------------------------------------------------------------------
+-- EYES (blinking + squinting against the sun)
+--------------------------------------------------------------------------------
+-- One table = one local variable. The two black eyelids are Frames that close in from the top
+-- and bottom of the screen; the HUD (DisplayOrder 10) stays on top of them.
+local eyes = {
+	frames = nil,
+	closure = 0,        -- how shut the eyes are right now (0 open .. 1 closed)
+	squint = 0,         -- the sun part of it
+	blinkT = nil,       -- seconds into the current blink, nil when not blinking
+	blinkDur = 0.2,
+	pending = 0,        -- queued extra blinks (double blink)
+	timer = randRange(2, 5),
+}
+
+eyes.blink = function(double)
+	if eyes.blinkT then return end
+	eyes.blinkT = 0
+	eyes.blinkDur = randRange(0.16, 0.24)
+	eyes.pending = double and 1 or 0
+end
+
+eyes.reset = function()
+	eyes.blinkT, eyes.pending = nil, 0
+	eyes.squint, eyes.closure = 0, 0
+	eyes.timer = randRange(2, 5)
+end
+
+eyes.create = function()
+	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+	local existing = playerGui:FindFirstChild("RealismEyelids")
+	if existing then existing:Destroy() end
+
+	local gui = trackInstance(Instance.new("ScreenGui"))
+	gui.Name = "RealismEyelids"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 5 -- over the world, under the HUD
+	gui.Parent = playerGui
+
+	local function lid(name, anchorY, rot)
+		local f = Instance.new("Frame")
+		f.Name = name
+		f.AnchorPoint = Vector2.new(0, anchorY)
+		f.Position = UDim2.new(0, 0, anchorY, 0)
+		f.Size = UDim2.new(1, 0, 0, 0)
+		f.BackgroundColor3 = Color3.fromRGB(10, 6, 6)
+		f.BorderSizePixel = 0
+		f.Visible = false
+		f.Parent = gui
+
+		local g = Instance.new("UIGradient") -- soft edge where the lid meets the view
+		g.Rotation = rot
+		g.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0),
+			NumberSequenceKeypoint.new(0.82, 0),
+			NumberSequenceKeypoint.new(1, 0.6),
+		})
+		g.Parent = f
+		return f
+	end
+
+	local full = Instance.new("Frame") -- seals the last gap when the eyes are fully shut
+	full.Name = "Full"
+	full.Size = UDim2.new(1, 0, 1, 0)
+	full.BackgroundColor3 = Color3.fromRGB(10, 6, 6)
+	full.BackgroundTransparency = 1
+	full.BorderSizePixel = 0
+	full.Visible = false
+	full.Parent = gui
+
+	eyes.frames = { top = lid("Top", 0, 90), bottom = lid("Bottom", 1, 270), full = full }
+end
+
+eyes.update = function(dt)
+	local e = eyes
+	local f = e.frames
+	if not f then return end
+
+	-- Squint: how directly you face the sun (sunGlare is already 0 behind clouds and walls)
+	-- times how strong the sun is (a low sun squints you less than a noon sun).
+	-- 0.9 is the most the eyes close from light alone: a thin slit, basically shut.
+	local power = 0.45 + 0.55 * math.clamp(Lighting:GetSunDirection().Y / 0.6, 0, 1)
+	local target = (math.clamp(sunGlare * power, 0, 1) ^ 0.85) * 0.9
+	e.squint = e.squint + (target - e.squint) * math.clamp(dt * (target > e.squint and 9 or 3), 0, 1)
+
+	local droop = staminaVisual * 0.16 -- heavy lids when winded
+
+	-- Blinking: more often when tired, less often with adrenaline
+	local blinkAmt = 0
+	if e.blinkT then
+		e.blinkT = e.blinkT + dt
+		local p = e.blinkT / e.blinkDur
+		if p >= 1 then
+			if e.pending > 0 then
+				e.pending = e.pending - 1
+				e.blinkT = 0
+				e.blinkDur = randRange(0.14, 0.2)
+			else
+				e.blinkT = nil
+				e.timer = randRange(2.5, 6) * (1 - 0.45 * staminaVisual) * (1 + 0.6 * adrenaline / 100)
+			end
+		else
+			local x = p < 0.4 and p / 0.4 or (1 - p) / 0.6 -- shuts fast, opens slower
+			blinkAmt = x * x * (3 - 2 * x)
+		end
+	elseif not (faint or ragdollData or fall.knock) then
+		e.timer = e.timer - dt
+		if e.timer <= 0 then eyes.blink(math.random() < 0.15) end -- now and then a double blink
+	end
+
+	-- A blink closes whatever gap the squint left open
+	local base = math.max(e.squint, droop)
+	local closure = base + (1 - base) * blinkAmt
+	e.closure = closure
+
+	if closure < 0.004 then
+		f.top.Visible, f.bottom.Visible, f.full.Visible = false, false, false
+	else
+		f.top.Visible, f.bottom.Visible = true, true
+		f.top.Size = UDim2.new(1, 0, closure * 0.56, 0)
+		f.bottom.Size = UDim2.new(1, 0, closure * 0.46, 0)
+		local seal = math.clamp((closure - 0.9) / 0.1, 0, 1)
+		f.full.Visible = seal > 0
+		f.full.BackgroundTransparency = 1 - seal
+	end
+end
+
+safeCall("eyes setup", eyes.create)
 
 --------------------------------------------------------------------------------
 -- RAYCAST HELPER (skips invisible parts so they don't block sight/sun)
@@ -1590,7 +1721,7 @@ local function createHUD()
 	versionTag.Name = "VersionTag"
 	versionTag.Size = UDim2.new(1, 0, 0, 14)
 	versionTag.BackgroundTransparency = 1
-	versionTag.Text = "Realism v7"
+	versionTag.Text = "Realism v8"
 	versionTag.TextColor3 = Color3.fromRGB(130, 140, 155)
 	versionTag.TextXAlignment = Enum.TextXAlignment.Right
 	versionTag.Font = Enum.Font.GothamMedium
@@ -1856,19 +1987,78 @@ local function createHUD()
 		stance.lastLabel = "stand"
 	end
 
+	-- Test menu: a lightning-bolt squircle opens a small panel with every test button in it
 	if CONFIG.TEST_BUTTONS then
-		local function testButton(text, y, onClick)
+		local toggle = Instance.new("TextButton")
+		toggle.Name = "TestToggle"
+		toggle.Size = UDim2.fromOffset(44, 44)
+		toggle.Position = UDim2.new(0, 10, 0, 70)
+		toggle.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+		toggle.BackgroundTransparency = 0.25
+		toggle.Text = "\u{26A1}"
+		toggle.TextSize = 24
+		toggle.Font = Enum.Font.GothamBold
+		toggle.TextColor3 = Color3.fromRGB(255, 220, 80)
+		toggle.AutoButtonColor = false
+		toggle.Parent = screenGui
+
+		local toggleCorner = Instance.new("UICorner")
+		toggleCorner.CornerRadius = UDim.new(0.3, 0) -- rounded square (squircle)
+		toggleCorner.Parent = toggle
+
+		local toggleStroke = Instance.new("UIStroke")
+		toggleStroke.Color = Color3.fromRGB(255, 220, 80)
+		toggleStroke.Thickness = 2
+		toggleStroke.Transparency = 0.5
+		toggleStroke.Parent = toggle
+
+		-- Two columns so the menu stays short on a phone screen
+		local menu = Instance.new("Frame")
+		menu.Name = "TestMenu"
+		menu.Position = UDim2.new(0, 10, 0, 120)
+		menu.Size = UDim2.fromOffset(0, 0)
+		menu.AutomaticSize = Enum.AutomaticSize.XY
+		menu.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+		menu.BackgroundTransparency = 0.35
+		menu.BorderSizePixel = 0
+		menu.Visible = false
+		menu.Parent = screenGui
+
+		local menuCorner = Instance.new("UICorner")
+		menuCorner.CornerRadius = UDim.new(0, 12)
+		menuCorner.Parent = menu
+
+		local menuPadding = Instance.new("UIPadding")
+		menuPadding.PaddingTop = UDim.new(0, 8)
+		menuPadding.PaddingBottom = UDim.new(0, 8)
+		menuPadding.PaddingLeft = UDim.new(0, 8)
+		menuPadding.PaddingRight = UDim.new(0, 8)
+		menuPadding.Parent = menu
+
+		local grid = Instance.new("UIGridLayout")
+		grid.CellSize = UDim2.fromOffset(84, 30)
+		grid.CellPadding = UDim2.fromOffset(6, 6)
+		grid.SortOrder = Enum.SortOrder.LayoutOrder
+		grid.Parent = menu
+
+		toggle.Activated:Connect(function()
+			menu.Visible = not menu.Visible
+			toggle.BackgroundColor3 = menu.Visible and Color3.fromRGB(70, 60, 20) or Color3.fromRGB(30, 30, 30)
+		end)
+
+		local order = 0
+		local function testButton(text, onClick)
+			order = order + 1
 			local b = Instance.new("TextButton")
 			b.Name = "Test" .. text
-			b.Size = UDim2.new(0, 80, 0, 30)
-			b.Position = UDim2.new(0, 10, 0, y)
+			b.LayoutOrder = order
 			b.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-			b.BackgroundTransparency = 0.3
+			b.BackgroundTransparency = 0.2
 			b.Text = text
-			b.TextColor3 = Color3.fromRGB(255, 255, 255)
+			b.TextColor3 = Color3.new(1, 1, 1)
 			b.Font = Enum.Font.GothamBold
 			b.TextSize = 12
-			b.Parent = screenGui
+			b.Parent = menu
 
 			local c = Instance.new("UICorner")
 			c.CornerRadius = UDim.new(0, 6)
@@ -1876,20 +2066,23 @@ local function createHUD()
 
 			b.Activated:Connect(onClick)
 		end
-		testButton("BLEED", 70, forceBleed)
-		testButton("STORM", 106, toggleStorm)
-		testButton("NIGHT", 142, function()
+		testButton("BLEED", forceBleed)
+		testButton("STORM", toggleStorm)
+		testButton("NIGHT", function()
 			Lighting.ClockTime = 0
 			temp.body = -0.6
 			showNotice("Midnight")
 		end)
-		testButton("NOON", 178, function()
+		testButton("NOON", function()
 			Lighting.ClockTime = 12
 			temp.body = 0.6
 			showNotice("High noon")
 		end)
-		testButton("FALL", 214, function()
+		testButton("FALL", function()
 			if runFallTest then runFallTest(100) end
+		end)
+		testButton("BLINK", function()
+			eyes.blink(false)
 		end)
 	end
 
@@ -4570,6 +4763,9 @@ local function mainUpdate(deltaTime)
 	local glareRate = sunTarget > sunGlare and CONFIG.SUN_GLARE_RISE or CONFIG.SUN_GLARE_FALL
 	sunGlare = sunGlare + (sunTarget - sunGlare) * math.clamp(deltaTime * glareRate, 0, 1)
 
+	-- F2b. Eyes: blinking, and squinting based on how directly (and how strongly) the sun hits you
+	safeCall("eyes", eyes.update, deltaTime)
+
 	local day, golden = updateTimeOfDayLighting()
 	safeCall("sky", sky.update, deltaTime, day, golden)
 	safeCall("water", water.update, deltaTime, day, golden, humanoid, hrp)
@@ -4724,6 +4920,9 @@ local function resetStateForNewCharacter()
 	fall.sprainLeft, fall.sprainStrength = 0, 0
 	fall.knock = nil
 
+	-- Fresh eyes: open, no squint, no blink in progress
+	eyes.reset()
+
 	-- Standing again (the new character's joints are read in stance.setup)
 	stance.ready = false
 	stance.char = nil
@@ -4786,7 +4985,7 @@ if CONFIG.DEBUG_KEYS then
 	end))
 end
 
-__toast("v7 loaded OK. Stance button is above RUN (or press C). Test buttons are on the left.")
+__toast("v8 loaded OK. Tap the lightning squircle (top left) for test buttons. Stance button is above RUN (or press C).")
 
 --------------------------------------------------------------------------------
 -- CLEANUP (runs automatically if the script is executed again)
@@ -4881,8 +5080,5 @@ end, function(e) return debug.traceback(tostring(e), 2) end)
 
 if not __ok then
 	__toast("SCRIPT CRASHED: " .. string.match(tostring(__err), "^[^\n]*"))
-	warn(__err)
-end
-"))
 	warn(__err)
 end
