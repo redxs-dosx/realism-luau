@@ -3,7 +3,8 @@
 -- so you don't need to find the console.
 -- v2: added BLEEDING (+ Bandage tool) and WEATHER (rain, wet screen, puddles, lightning)
 -- v3: added TEMPERATURE (+ Campfire tool) and FALL INJURIES (stumble, sprained ankle, knockdown)
--- v4: longer sprint, STANCES (crouch / crawl / sit button), randomized weather, new HUD
+-- v4: longer sprint, STANCES (crouch / sit / crawl button), randomized weather, new HUD
+-- v4 stance fix: real leg geometry, torso leans about the hips, camera follows the real head
 
 local __toasts = 0
 local function __toast(text)
@@ -128,19 +129,32 @@ local CONFIG = {
 	SPRINT_RESUME_THRESHOLD = 20,
 	ADRENALINE_STAMINA_DRAIN_MULT = 0,
 
-	-- Stances: the STANCE button (or the C key) cycles Stand > Crouch > Crawl > Sit.
-	-- thigh / knee: leg bend in degrees. pitch: how far the torso leans forward (crawl lies flat).
-	-- hip: fixed body height in studs (leave out to work it out from the leg bend).
-	-- rootDrop: studs the torso drops while leaning. speed: walk speed multiplier (0 = can't move).
-	-- quiet: footstep volume multiplier. camDrop: camera lowering for R6 avatars (R15 lowers its body instead).
+	-- Stances: the STANCE button (or the C key) cycles Stand > Crouch > Sit > Crawl.
+	-- Angles are in degrees, measured against the WORLD:
+	--   thigh / thighR: leg angle from hanging straight down. 90 = leg straight out forward, negative = trailing behind.
+	--   knee: how far the knee is folded (R15 only, R6 legs are rigid).
+	--   pitch: torso lean forward from the hips (90 = lying flat on your stomach).
+	--   head: how far the head still tilts forward (0 = looking level).
+	--   arm: arm angle from hanging down (90 = arms straight out forward).
+	--   hipY: height of the hip joint above the ground in studs (leave out to work it out from the leg bend).
+	--   flat: 1 = feet stay flat on the ground, 0 = feet follow the leg (toes down when crawling).
+	--   armSwing / legSwing: how far arms and legs move while you walk in that stance.
+	--   speed: walk speed multiplier (0 = can't move). quiet: footstep volume multiplier.
+	--   r6 = { ... }: values that replace the ones above for R6 avatars (rigid legs, so crouch becomes a lunge).
 	ENABLE_STANCES = true,
 	STANCE_KEY = Enum.KeyCode.C,
-	STANCE_BLEND_SPEED = 7,         -- how quickly you move between stances
+	STANCE_BLEND_SPEED = 5,         -- how quickly you move between stances
+	STANCE_GAIT_RATE = 2.2,         -- arm / leg swing speed while crawling
+	STANCE_ANIM_DAMP = 0.9,         -- how much of the default walk/idle animation is faded out in a stance (1 = all)
+	MIN_HIP_HEIGHT = 0,             -- lowest HipHeight a stance may use; anything lower slides the body down instead
 	STANCES = {
-		stand  = { thigh = 0,  knee = 0,  pitch = 0,  rootDrop = 0,    speed = 1,    quiet = 1,    camDrop = 0 },
-		crouch = { thigh = 75, knee = 75, pitch = 8,  rootDrop = 0,    speed = 0.5,  quiet = 0.45, camDrop = 1.2 },
-		crawl  = { thigh = 0,  knee = 0,  pitch = 88, rootDrop = 0.55, hip = 0.35, speed = 0.25, quiet = 0.2, camDrop = 2.2 },
-		sit    = { thigh = 90, knee = 0,  pitch = 0,  rootDrop = 0,    hip = 0.2,  speed = 0,    quiet = 0,   camDrop = 2.0 },
+		stand  = {},
+		crouch = { thigh = 105, knee = 145, pitch = 20, head = 0, arm = 30, speed = 0.5, quiet = 0.45,
+			r6 = { thigh = 62, thighR = -62, knee = 0, pitch = 25 } },
+		sit    = { thigh = 140, knee = 80, pitch = 10, head = 0, arm = 40, speed = 0, quiet = 0,
+			r6 = { thigh = 90, knee = 0, pitch = 12, hipY = 0.5 } },
+		crawl  = { thigh = -90, knee = 0, pitch = 90, head = 45, arm = 90, hipY = 0.55, flat = 0,
+			armSwing = 30, legSwing = -15, speed = 0.25, quiet = 0.2 },
 	},
 
 	-- Leg Strength
@@ -494,17 +508,23 @@ local fall = {
 -- this script was already close to that limit.
 local stance = {
 	mode = "stand",
-	order = { "stand", "crouch", "crawl", "sit" },
+	order = { "stand", "crouch", "sit", "crawl" },
 	ready = false,
 	char = nil,
 	r15 = false,
-	joints = {},             -- [key] = { motor, base } for RootJoint, hips and knees (R15 only)
+	joints = {},             -- [key] = { motor, base }
+	defs = {},               -- resolved poses for this avatar
+	pivot = Vector3.zero,    -- hip pivot in HumanoidRootPart space
+	upper = 1, lower = 1, foot = 0.3,
 	baseHip = 2,
 	baseJumpPower = 50,
 	baseJumpHeight = 7.2,
-	legUpper = 1,
-	legLower = 1,
-	cur = { thigh = 0, knee = 0, pitch = 0, rootDrop = 0, hip = 2, speed = 1, quiet = 1, camDrop = 0 },
+	phase = 0,
+	moving = 0,
+	dirty = false,           -- true while any pose is applied
+	lastCam = Vector3.zero,  -- the CameraOffset we set last frame
+	cur = { thigh = 0, thighR = 0, knee = 0, pitch = 0, head = 0, arm = 0, flat = 1, drop = 0,
+		armSwing = 0, legSwing = 0, speed = 1, quiet = 1, amount = 0, hip = 2, camDrop = 0 },
 	button = nil,
 	lastLabel = nil,
 }
@@ -657,6 +677,7 @@ local function setupFirstPersonAndBobbing(character)
 			if ragdollData then
 				-- Ragdolled: the camera rides on the limp head, so you see the fall
 				humanoid.CameraOffset = Vector3.zero
+				stance.lastCam = Vector3.zero
 				local head = character:FindFirstChild("Head")
 				if head then
 					local target = head.CFrame * CFrame.new(0, 0.1, -0.5)
@@ -696,8 +717,8 @@ local function setupFirstPersonAndBobbing(character)
 				landingOffset = landingOffset + landingVelocity * dt
 
 				bobX = bobX + math.sin(bobIndex) * CONFIG.LIMP_SWAY * limpFactor
-				-- stance.cur.camDrop only lowers the camera for R6 avatars (R15 lowers its whole body)
-				humanoid.CameraOffset = Vector3.new(bobX, bobY + landingOffset - stance.cur.camDrop, -CONFIG.CAMERA_FORWARD_OFFSET)
+				-- In a stance the camera moves to the real head position (see stance.cameraOffset)
+				humanoid.CameraOffset = stance.cameraOffset(character, hrp, Vector3.new(bobX, bobY + landingOffset, -CONFIG.CAMERA_FORWARD_OFFSET))
 
 				-- Strafe tilt
 				local relativeVel = hrp.CFrame:VectorToObjectSpace(flatVelocity)
@@ -1184,127 +1205,285 @@ local function forceBleed()
 end
 
 --------------------------------------------------------------------------------
--- 3c. STANCES (stand / crouch / crawl / sit)
+-- 3c. STANCES (stand / crouch / sit / crawl)
 --------------------------------------------------------------------------------
--- R15 avatars: the legs bend through the hip/knee joints, the torso leans through the root
--- joint, and the body height drops through HipHeight. R6 avatars only get a lower camera
--- and slower movement. Only your own client sees the pose.
+-- How the poses work (R15 and R6):
+--  * The torso leans about the HIPS, the legs bend so the feet stay on the ground, and the
+--    arms and head are posed to match. Only your own client sees the pose.
+--  * Body height comes from the leg bend (HipHeight). When a pose needs the body lower than
+--    HipHeight 0 allows (sitting, R6 avatars), the body is slid down on its root joint instead.
+--  * Roblox's default camera follows the HumanoidRootPart, NOT your head, so lowering the body
+--    never lowered the view. stance.cameraOffset puts the camera at the real head position.
+--  * The default walk / idle animations are faded out while you are in a stance.
 
--- Rotates a joint's C0 about its own pivot, in the parent part's space
-stance.rotatedC0 = function(base, rotation)
-	local p = base.Position
+stance.keys = { "thigh", "thighR", "knee", "pitch", "head", "arm", "flat", "drop", "armSwing", "legSwing", "speed", "quiet" }
+stance.defaults = { thigh = 0, knee = 0, pitch = 0, head = 0, arm = 0, flat = 1, drop = 0, armSwing = 0, legSwing = 0, speed = 1, quiet = 1 }
+
+-- Rotates a joint's C0 about a pivot point (default: the joint itself), in the parent part's space
+stance.rotatedC0 = function(base, rotation, pivot)
+	local p = pivot or base.Position
 	return CFrame.new(p) * rotation * CFrame.new(-p) * base
 end
 
--- Puts every joint, the hip height and the jump back exactly as they were
+-- Height of the hip joint above the ground for a given leg bend (feet flat on the floor)
+stance.reach = function(thighDeg, kneeDeg)
+	local a = math.rad(thighDeg)
+	local k = math.rad(kneeDeg)
+	return stance.upper * math.cos(a) + stance.lower * math.cos(a - k) + stance.foot
+end
+
+stance.resetCur = function()
+	local c = stance.cur
+	c.thigh, c.thighR, c.knee, c.pitch, c.head, c.arm = 0, 0, 0, 0, 0, 0
+	c.flat, c.drop, c.armSwing, c.legSwing = 1, 0, 0, 0
+	c.speed, c.quiet, c.amount, c.camDrop = 1, 1, 0, 0
+	c.hip = stance.baseHip
+end
+
+-- Puts every joint, the hip height, the jump and the animations back exactly as they were
 stance.restore = function()
+	local wasActive = stance.dirty
+
 	for _, j in pairs(stance.joints) do
 		if j.motor and j.motor.Parent then j.motor.C0 = j.base end
 	end
 
 	local char = stance.char
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	if hum and stance.ready then
-		if stance.r15 then hum.HipHeight = stance.baseHip end
+	if hum and stance.ready and wasActive then
+		hum.HipHeight = stance.baseHip
 		hum.JumpPower = stance.baseJumpPower
 		hum.JumpHeight = stance.baseJumpHeight
+		local animator = hum:FindFirstChildOfClass("Animator")
+		if animator then
+			for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+				track:AdjustWeight(1, 0)
+			end
+		end
 	end
 
 	stance.mode = "stand"
-	local c = stance.cur
-	c.thigh, c.knee, c.pitch, c.rootDrop = 0, 0, 0, 0
-	c.speed, c.quiet, c.camDrop = 1, 1, 0
-	c.hip = stance.baseHip
+	stance.dirty = false
+	stance.moving = 0
+	stance.lastCam = Vector3.zero
+	stance.resetCur()
 end
 
--- Reads the avatar's joints and remembers how they look standing up
+-- Reads the avatar's joints and leg lengths, and works out every pose for this body
 stance.setup = function(char)
 	stance.ready = false
 	stance.char = char
 	stance.joints = {}
+	stance.defs = {}
+	stance.phase = 0
+	stance.moving = 0
+	stance.dirty = false
+	stance.lastCam = Vector3.zero
 
 	local humanoid = char:WaitForChild("Humanoid", 5)
 	if not humanoid then return end
-
 	stance.r15 = humanoid.RigType == Enum.HumanoidRigType.R15
+
+	local names
 	if stance.r15 then
-		for _, name in ipairs({ "LowerTorso", "LeftUpperLeg", "LeftLowerLeg", "RightUpperLeg", "RightLowerLeg" }) do
-			char:WaitForChild(name, 5)
+		for _, n in ipairs({ "LowerTorso", "UpperTorso", "LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
+			"RightUpperLeg", "RightLowerLeg", "RightFoot", "LeftUpperArm", "RightUpperArm", "Head" }) do
+			char:WaitForChild(n, 5)
 		end
-		local names = { root = "RootJoint", lHip = "LeftHip", rHip = "RightHip", lKnee = "LeftKnee", rKnee = "RightKnee" }
-		for key, name in pairs(names) do
-			local motor = char:FindFirstChild(name, true)
-			if motor and motor:IsA("Motor6D") then
-				stance.joints[key] = { motor = motor, base = motor.C0 }
+		names = { root = "RootJoint", lHip = "LeftHip", rHip = "RightHip", lKnee = "LeftKnee", rKnee = "RightKnee",
+			lAnkle = "LeftAnkle", rAnkle = "RightAnkle", lShoulder = "LeftShoulder", rShoulder = "RightShoulder", neck = "Neck" }
+	else
+		for _, n in ipairs({ "Torso", "Left Leg", "Right Leg", "Left Arm", "Right Arm", "Head" }) do
+			char:WaitForChild(n, 5)
+		end
+		names = { root = "RootJoint", lHip = "Left Hip", rHip = "Right Hip",
+			lShoulder = "Left Shoulder", rShoulder = "Right Shoulder", neck = "Neck" }
+	end
+
+	local j = stance.joints
+	for key, name in pairs(names) do
+		local motor = char:FindFirstChild(name, true)
+		if motor and motor:IsA("Motor6D") then
+			j[key] = { motor = motor, base = motor.C0 }
+		end
+	end
+
+	-- Leg lengths straight from the rig's joints, so any avatar proportions work
+	if stance.r15 then
+		stance.upper, stance.lower, stance.foot = 1.0, 1.2, 0.3 -- fallback
+		local foot = char:FindFirstChild("LeftFoot")
+		if j.lHip and j.lKnee and j.lAnkle and foot then
+			local upper = (j.lKnee.motor.C0.Position - j.lHip.motor.C1.Position).Magnitude
+			local lower = (j.lAnkle.motor.C0.Position - j.lKnee.motor.C1.Position).Magnitude
+			local footH = foot.Size.Y / 2 + j.lAnkle.motor.C1.Position.Y
+			if upper > 0.3 and lower > 0.3 and footH > 0 then
+				stance.upper, stance.lower, stance.foot = upper, lower, footH
 			end
 		end
-		local upper = char:FindFirstChild("LeftUpperLeg")
-		local lower = char:FindFirstChild("LeftLowerLeg")
-		stance.legUpper = upper and upper.Size.Y or 1
-		stance.legLower = lower and lower.Size.Y or 1
+	else
+		stance.upper, stance.lower, stance.foot = 2, 0, 0 -- one rigid leg
+		local leg = char:FindFirstChild("Left Leg")
+		if leg and j.lHip then
+			stance.upper = leg.Size.Y / 2 + j.lHip.motor.C1.Position.Y
+		end
+	end
+
+	-- The torso leans about the hips: find the hip pivot in HumanoidRootPart space
+	local root = j.root
+	if root then
+		local pl = j.lHip and j.lHip.motor.C0.Position
+		local pr = j.rHip and j.rHip.motor.C0.Position
+		local p = (pl and pr) and (pl + pr) / 2 or Vector3.new(0, stance.r15 and -0.2 or -1, 0)
+		stance.pivot = (root.motor.C0 * root.motor.C1:Inverse()) * p
 	end
 
 	if LocalPlayer.Character ~= char then return end
 	stance.baseHip = humanoid.HipHeight
 	stance.baseJumpPower = humanoid.JumpPower
 	stance.baseJumpHeight = humanoid.JumpHeight
+
+	-- Resolve every pose for this rig (R6 overrides, defaults, hip height)
+	local standReach = stance.reach(0, 0)
+	for mode, def in pairs(CONFIG.STANCES) do
+		local d = {}
+		for key, value in pairs(def) do d[key] = value end
+		if not stance.r15 and def.r6 then
+			for key, value in pairs(def.r6) do d[key] = value end
+		end
+		d.r6 = nil
+		for key, value in pairs(stance.defaults) do
+			if d[key] == nil then d[key] = value end
+		end
+		if d.thighR == nil then d.thighR = d.thigh end
+		if d.hipY == nil then
+			d.hipY = math.max(stance.reach(d.thigh, d.knee), stance.reach(d.thighR, d.knee))
+		end
+		local raw = stance.baseHip + d.hipY - standReach
+		d.hipHeight = math.max(CONFIG.MIN_HIP_HEIGHT, raw)
+		d.drop = d.hipHeight - raw -- how far the body must slide down because HipHeight can't go lower
+		if mode == "stand" then
+			d.hipHeight, d.drop = stance.baseHip, 0
+		end
+		stance.defs[mode] = d
+	end
+	if not stance.defs.stand then return end
+
 	stance.mode = "stand"
-	local c = stance.cur
-	c.thigh, c.knee, c.pitch, c.rootDrop = 0, 0, 0, 0
-	c.speed, c.quiet, c.camDrop = 1, 1, 0
-	c.hip = stance.baseHip
+	stance.resetCur()
 	stance.ready = true
 end
 
 -- Runs every render frame: eases toward the current stance and writes the pose
 stance.apply = function(dt, character, humanoid)
 	if not stance.ready or stance.char ~= character then return end
+	if stance.mode == "stand" and not stance.dirty then return end -- nothing to do while standing
 
-	local def = CONFIG.STANCES[stance.mode] or CONFIG.STANCES.stand
+	local def = stance.defs[stance.mode] or stance.defs.stand
 	local cur = stance.cur
 	local k = math.clamp(dt * CONFIG.STANCE_BLEND_SPEED, 0, 1)
 
-	-- Where the hips need to sit so the feet stay on the ground
-	local targetHip = stance.baseHip
-	if stance.r15 then
-		if def.hip then
-			targetHip = math.min(def.hip, stance.baseHip)
-		else
-			local thigh = math.rad(def.thigh)
-			local knee = math.rad(def.knee)
-			targetHip = stance.baseHip - (stance.legUpper * (1 - math.cos(thigh)) + stance.legLower * (1 - math.cos(thigh - knee)))
+	for _, key in ipairs(stance.keys) do
+		cur[key] = cur[key] + (def[key] - cur[key]) * k
+	end
+	cur.hip = cur.hip + (def.hipHeight - cur.hip) * k
+	cur.amount = cur.amount + ((stance.mode == "stand" and 0 or 1) - cur.amount) * k
+
+	-- Back on your feet and settled: hand everything back exactly as the game had it
+	if stance.mode == "stand" and cur.amount < 0.01 then
+		stance.restore()
+		return
+	end
+
+	-- Changing body height shouldn't count as a fall
+	if math.abs(def.hipHeight - cur.hip) > 0.05 then peakFallSpeed = 0 end
+
+	-- Gait: arms and legs alternate while you move (only poses with armSwing / legSwing use it)
+	local hrp = character:FindFirstChild("HumanoidRootPart")
+	local v = hrp and hrp.AssemblyLinearVelocity or Vector3.zero
+	local flatSpeed = Vector3.new(v.X, 0, v.Z).Magnitude
+	local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
+	if grounded then
+		stance.phase = stance.phase + flatSpeed * dt * CONFIG.STANCE_GAIT_RATE
+	end
+	local moveTarget = (grounded and flatSpeed > 0.5) and 1 or 0
+	stance.moving = stance.moving + (moveTarget - stance.moving) * math.clamp(dt * 8, 0, 1)
+	local s = math.sin(stance.phase) * stance.moving
+	local a1, a2 = 0.5 + 0.5 * s, 0.5 - 0.5 * s
+
+	local thL = cur.thigh + cur.legSwing * a1
+	local thR = cur.thighR + cur.legSwing * a2
+	local arL = cur.arm + cur.armSwing * a2 -- each arm moves with the opposite leg
+	local arR = cur.arm + cur.armSwing * a1
+	local lean = math.rad(cur.pitch)
+
+	local j = stance.joints
+	local function put(key, rotation, pivot)
+		local joint = j[key]
+		if joint and joint.motor.Parent then
+			joint.motor.C0 = stance.rotatedC0(joint.base, rotation, pivot)
 		end
 	end
 
-	cur.thigh = cur.thigh + (def.thigh - cur.thigh) * k
-	cur.knee = cur.knee + (def.knee - cur.knee) * k
-	cur.pitch = cur.pitch + (def.pitch - cur.pitch) * k
-	cur.rootDrop = cur.rootDrop + (def.rootDrop - cur.rootDrop) * k
-	cur.hip = cur.hip + (targetHip - cur.hip) * k
-	cur.speed = cur.speed + (def.speed - cur.speed) * k
-	cur.quiet = cur.quiet + (def.quiet - cur.quiet) * k
-	cur.camDrop = cur.camDrop + ((stance.r15 and 0 or def.camDrop) - cur.camDrop) * k
-
-	if stance.r15 then
-		humanoid.HipHeight = cur.hip
-
-		local j = stance.joints
-		local thigh = CFrame.Angles(math.rad(cur.thigh), 0, 0)  -- positive swings the leg forward
-		local knee = CFrame.Angles(-math.rad(cur.knee), 0, 0)   -- negative folds the shin back
-		if j.lHip and j.lHip.motor.Parent then j.lHip.motor.C0 = stance.rotatedC0(j.lHip.base, thigh) end
-		if j.rHip and j.rHip.motor.Parent then j.rHip.motor.C0 = stance.rotatedC0(j.rHip.base, thigh) end
-		if j.lKnee and j.lKnee.motor.Parent then j.lKnee.motor.C0 = stance.rotatedC0(j.lKnee.base, knee) end
-		if j.rKnee and j.rKnee.motor.Parent then j.rKnee.motor.C0 = stance.rotatedC0(j.rKnee.base, knee) end
-		if j.root and j.root.motor.Parent then
-			-- Lean the whole body forward about the root part (this is what makes the crawl lie flat)
-			j.root.motor.C0 = CFrame.new(0, -cur.rootDrop, 0) * CFrame.Angles(-math.rad(cur.pitch), 0, 0) * j.root.base
-		end
+	-- Torso: lean about the hips, and slide down if HipHeight can't go low enough
+	local rootJoint = j.root
+	if rootJoint and rootJoint.motor.Parent then
+		rootJoint.motor.C0 = CFrame.new(0, -cur.drop, 0)
+			* stance.rotatedC0(rootJoint.base, CFrame.Angles(-lean, 0, 0), stance.pivot)
 	end
+
+	-- Angles are world angles, so the leans are added back on top of the torso lean
+	put("lHip", CFrame.Angles(math.rad(thL) + lean, 0, 0))
+	put("rHip", CFrame.Angles(math.rad(thR) + lean, 0, 0))
+	if stance.r15 then
+		local knee = CFrame.Angles(-math.rad(cur.knee), 0, 0)
+		put("lKnee", knee)
+		put("rKnee", knee)
+		-- Ankles cancel the leg angle so the soles stay flat on the ground (flat = 1)
+		put("lAnkle", CFrame.Angles(math.rad(cur.flat * (cur.knee - thL)), 0, 0))
+		put("rAnkle", CFrame.Angles(math.rad(cur.flat * (cur.knee - thR)), 0, 0))
+	end
+	put("lShoulder", CFrame.Angles(math.rad(arL) + lean, 0, 0))
+	put("rShoulder", CFrame.Angles(math.rad(arR) + lean, 0, 0))
+	put("neck", CFrame.Angles(lean - math.rad(cur.head), 0, 0))
+
+	humanoid.HipHeight = cur.hip
 
 	-- No jumping out of a stance: pressing jump stands you up instead (see JumpRequest below)
 	local locked = stance.mode ~= "stand"
 	humanoid.JumpPower = locked and 0 or stance.baseJumpPower
 	humanoid.JumpHeight = locked and 0 or stance.baseJumpHeight
+
+	-- Fade out the default walk / idle animation so it doesn't fight the pose
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+	if animator then
+		local w = 1 - CONFIG.STANCE_ANIM_DAMP * cur.amount
+		for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+			if math.abs(track.WeightTarget - w) > 0.02 then
+				track:AdjustWeight(w, 0)
+			end
+		end
+	end
+end
+
+-- The default camera follows the HumanoidRootPart, so in a stance we move it onto the real head.
+-- `legacy` is the normal bob offset; the result blends between it and the head position.
+stance.cameraOffset = function(character, hrp, legacy)
+	local out = legacy
+	local cur = stance.cur
+	if stance.ready and stance.char == character and cur.amount > 0.001 then
+		local head = character:FindFirstChild("Head")
+		if head and Camera then
+			-- Where the camera sits with no offset, then where the eyes really are
+			local base = Camera.CFrame.Position - hrp.CFrame:VectorToWorldSpace(stance.lastCam)
+			local eye = head.CFrame:PointToWorldSpace(Vector3.new(0, 0.1, -0.5))
+			local want = hrp.CFrame:VectorToObjectSpace(eye - base) + Vector3.new(legacy.X, legacy.Y, 0)
+			if want.Magnitude < 10 then
+				out = legacy:Lerp(want, math.clamp(cur.amount, 0, 1))
+			end
+		end
+	end
+	stance.lastCam = out
+	return out
 end
 
 -- Switches stance. Returns false if something stopped it.
@@ -1315,6 +1494,7 @@ stance.set = function(mode)
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	local root = char and char:FindFirstChild("HumanoidRootPart")
 	if not stance.ready or stance.char ~= char or not hum or not root or hum.Health <= 0 then return false end
+	if not stance.defs[mode] then return false end
 	if faint or fall.knock or ragdollData then return false end
 	if hum.FloorMaterial == Enum.Material.Air then return false end
 
@@ -1328,10 +1508,11 @@ stance.set = function(mode)
 	end
 
 	stance.mode = mode
+	stance.dirty = true
 	return true
 end
 
--- Stand > Crouch > Crawl > Sit > Stand ...
+-- Stand > Crouch > Sit > Crawl > Stand ...
 stance.cycle = function()
 	if not CONFIG.ENABLE_STANCES then return end
 	local idx = table.find(stance.order, stance.mode) or 1
@@ -1659,7 +1840,7 @@ local function createHUD()
 		end))
 	end
 
-	-- Stance button: tap to cycle Stand > Crouch > Crawl > Sit (PC: press C)
+	-- Stance button: tap to cycle Stand > Crouch > Sit > Crawl (PC: press C)
 	if CONFIG.ENABLE_STANCES then
 		local stanceBtn = makeRoundButton("StanceButton", "STAND", UDim2.new(1, -170, 1, -295), Color3.fromRGB(120, 180, 255))
 		stanceBtn.Activated:Connect(function()
@@ -3614,9 +3795,9 @@ local function resetStateForNewCharacter()
 	stance.char = nil
 	stance.joints = {}
 	stance.mode = "stand"
-	local c = stance.cur
-	c.thigh, c.knee, c.pitch, c.rootDrop = 0, 0, 0, 0
-	c.speed, c.quiet, c.camDrop = 1, 1, 0
+	stance.dirty = false
+	stance.lastCam = Vector3.zero
+	stance.resetCur()
 end
 
 -- Each system starts on its own, so one failing never stops the others
@@ -3636,7 +3817,7 @@ if LocalPlayer.Character then
 	initCharacter(LocalPlayer.Character)
 end
 
--- Stance controls: C cycles Stand > Crouch > Crawl > Sit. Jumping stands you back up.
+-- Stance controls: C cycles Stand > Crouch > Sit > Crawl. Jumping stands you back up.
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	if gameProcessed then return end
 	if CONFIG.ENABLE_STANCES and input.KeyCode == CONFIG.STANCE_KEY then
