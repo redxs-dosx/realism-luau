@@ -3,6 +3,7 @@
 -- so you don't need to find the console.
 -- v2: added BLEEDING (+ Bandage tool) and WEATHER (rain, wet screen, puddles, lightning)
 -- v3: added TEMPERATURE (+ Campfire tool) and FALL INJURIES (stumble, sprained ankle, knockdown)
+-- v4: longer sprint, STANCES (crouch / crawl / sit button), randomized weather, new HUD
 
 local __toasts = 0
 local function __toast(text)
@@ -42,6 +43,10 @@ local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
 local BIND_NAME = "RealismBodyAndCameraUpdate"
+
+-- Many executors leave Lua's random generator unseeded, which made the weather start at the
+-- same moment every time. Seed it, and give the weather its own Random object as well.
+math.randomseed(os.time() + math.floor(os.clock() * 100000))
 
 --------------------------------------------------------------------------------
 -- RE-RUN SAFETY: clean up any previous run, and register cleanup for this one
@@ -116,11 +121,27 @@ local CONFIG = {
 
 	-- Stamina & Sprint System
 	MAX_STAMINA = 100,
-	STAMINA_DRAIN_RATE = 20,
-	STAMINA_REGEN_RATE = 15,        -- stamina/sec recovered while standing still
+	STAMINA_DRAIN_RATE = 5,         -- stamina/sec while sprinting (5 = a 20 second sprint from full)
+	STAMINA_FITNESS_BONUS = 0.4,    -- at max leg strength your sprint drains this much slower (0.4 = 40%)
+	STAMINA_REGEN_RATE = 12,        -- stamina/sec recovered while standing still
 	STAMINA_REGEN_WALK = 1,         -- stamina/sec recovered while walking (very slow)
 	SPRINT_RESUME_THRESHOLD = 20,
 	ADRENALINE_STAMINA_DRAIN_MULT = 0,
+
+	-- Stances: the STANCE button (or the C key) cycles Stand > Crouch > Crawl > Sit.
+	-- thigh / knee: leg bend in degrees. pitch: how far the torso leans forward (crawl lies flat).
+	-- hip: fixed body height in studs (leave out to work it out from the leg bend).
+	-- rootDrop: studs the torso drops while leaning. speed: walk speed multiplier (0 = can't move).
+	-- quiet: footstep volume multiplier. camDrop: camera lowering for R6 avatars (R15 lowers its body instead).
+	ENABLE_STANCES = true,
+	STANCE_KEY = Enum.KeyCode.C,
+	STANCE_BLEND_SPEED = 7,         -- how quickly you move between stances
+	STANCES = {
+		stand  = { thigh = 0,  knee = 0,  pitch = 0,  rootDrop = 0,    speed = 1,    quiet = 1,    camDrop = 0 },
+		crouch = { thigh = 75, knee = 75, pitch = 8,  rootDrop = 0,    speed = 0.5,  quiet = 0.45, camDrop = 1.2 },
+		crawl  = { thigh = 0,  knee = 0,  pitch = 88, rootDrop = 0.55, hip = 0.35, speed = 0.25, quiet = 0.2, camDrop = 2.2 },
+		sit    = { thigh = 90, knee = 0,  pitch = 0,  rootDrop = 0,    hip = 0.2,  speed = 0,    quiet = 0,   camDrop = 2.0 },
+	},
 
 	-- Leg Strength
 	MAX_RUN_SPEED = 36,
@@ -215,17 +236,20 @@ local CONFIG = {
 	ENABLE_DAY_NIGHT = true,
 	DAY_NIGHT_SPEED = 0.03,
 
-	-- Weather (random rain showers that come and go)
+	-- Weather (random rain showers that come and go; every shower ends on its own)
 	ENABLE_WEATHER = true,
 	CLEAR_MIN_TIME = 90,           -- seconds of dry weather between showers (random min/max)
-	CLEAR_MAX_TIME = 240,
-	RAIN_MIN_TIME = 60,            -- how long a shower lasts (random min/max)
-	RAIN_MAX_TIME = 180,
+	CLEAR_MAX_TIME = 300,
+	RAIN_MIN_TIME = 45,            -- how long a shower lasts (random min/max)
+	RAIN_MAX_TIME = 150,
 	RAIN_MIN_INTENSITY = 0.4,      -- each shower picks a strength between this and 1
 	RAIN_FADE_TIME = 12,           -- seconds to fade a shower in or out
-	FIRST_RAIN_MIN = 10,           -- the first shower after you run the script starts after this many seconds (random min/max)
-	FIRST_RAIN_MAX = 25,
-	RAIN_STREAKS = 240,            -- 3D raindrops around you at full intensity (lower this if it lags)
+	FIRST_RAIN_MIN = 20,           -- the first shower after you run the script starts after this many seconds (random min/max)
+	FIRST_RAIN_MAX = 240,
+	START_RAINING_CHANCE = 0.15,   -- chance it is ALREADY raining when you run the script
+	STORM_BUTTON_MIN = 45,         -- a storm you start with the STORM button / K key lasts this long (random min/max)
+	STORM_BUTTON_MAX = 90,
+	RAIN_STREAKS = 240,            -- 3D raindrops around you at full intensity (halved automatically on touch devices)
 	RAIN_RADIUS = 28,              -- how far around you the rain falls (studs)
 	RAIN_SPEED = 65,               -- fall speed (studs/sec)
 	RAIN_LENGTH = 4,               -- length of each streak (studs)
@@ -380,8 +404,12 @@ local CONFIG = {
 --------------------------------------------------------------------------------
 -- STATE VARIABLES
 --------------------------------------------------------------------------------
-local function randRange(a, b)
-	return a + math.random() * (b - a)
+local randRange
+do
+	local rng = Random.new()
+	randRange = function(a, b)
+		return rng:NextNumber(a, b)
+	end
 end
 
 local adrenaline = 0
@@ -461,6 +489,26 @@ local fall = {
 	knock = nil,             -- { t, dur, look } while you're knocked down
 }
 
+-- Stances (everything in one table; its functions are defined in section 3c).
+-- Kept in a table on purpose: Luau allows at most 200 local variables in one scope and
+-- this script was already close to that limit.
+local stance = {
+	mode = "stand",
+	order = { "stand", "crouch", "crawl", "sit" },
+	ready = false,
+	char = nil,
+	r15 = false,
+	joints = {},             -- [key] = { motor, base } for RootJoint, hips and knees (R15 only)
+	baseHip = 2,
+	baseJumpPower = 50,
+	baseJumpHeight = 7.2,
+	legUpper = 1,
+	legLower = 1,
+	cur = { thigh = 0, knee = 0, pitch = 0, rootDrop = 0, hip = 2, speed = 1, quiet = 1, camDrop = 0 },
+	button = nil,
+	lastLabel = nil,
+}
+
 -- Weather (everything in one table)
 local weather = {
 	rain = 0,                -- current rain strength 0..1 (fades toward target)
@@ -479,6 +527,14 @@ local weather = {
 	part = nil,              -- invisible part that follows the camera and emits rain
 	emitter = nil,
 }
+
+-- Sometimes the script starts in the middle of a shower
+if randRange(0, 1) < CONFIG.START_RAINING_CHANCE then
+	weather.target = randRange(CONFIG.RAIN_MIN_INTENSITY, 1)
+	weather.rain = weather.target
+	weather.wet = 0.5
+	weather.timer = randRange(CONFIG.RAIN_MIN_TIME, CONFIG.RAIN_MAX_TIME)
+end
 
 --------------------------------------------------------------------------------
 -- RAYCAST HELPER (skips invisible parts so they don't block sight/sun)
@@ -515,7 +571,6 @@ track(UserInputService.InputEnded:Connect(function(input)
 		shiftPressed = false
 	end
 end))
-
 --------------------------------------------------------------------------------
 -- 1. FIRST-PERSON LOCK, BODY VISIBILITY & HEAD BOBBING
 --------------------------------------------------------------------------------
@@ -641,7 +696,8 @@ local function setupFirstPersonAndBobbing(character)
 				landingOffset = landingOffset + landingVelocity * dt
 
 				bobX = bobX + math.sin(bobIndex) * CONFIG.LIMP_SWAY * limpFactor
-				humanoid.CameraOffset = Vector3.new(bobX, bobY + landingOffset, -CONFIG.CAMERA_FORWARD_OFFSET)
+				-- stance.cur.camDrop only lowers the camera for R6 avatars (R15 lowers its whole body)
+				humanoid.CameraOffset = Vector3.new(bobX, bobY + landingOffset - stance.cur.camDrop, -CONFIG.CAMERA_FORWARD_OFFSET)
 
 				-- Strafe tilt
 				local relativeVel = hrp.CFrame:VectorToObjectSpace(flatVelocity)
@@ -650,6 +706,7 @@ local function setupFirstPersonAndBobbing(character)
 
 				currentRoll = currentRoll + (targetRoll - currentRoll) * math.clamp(deltaTime * 10, 0, 1)
 				updateHandSway(deltaTime, character, moveSpeed, humanoid.WalkSpeed)
+				stance.apply(deltaTime, character, humanoid)
 
 				Camera.CFrame = Camera.CFrame * CFrame.Angles(0, 0, currentRoll + fall.roll)
 			end
@@ -1117,7 +1174,8 @@ local function toggleStorm()
 		weather.lightningTimer = math.min(weather.lightningTimer, 3)
 		showNotice("A storm is rolling in")
 	end
-	weather.timer = 120 -- hold it for a while before the schedule takes over
+	-- A storm you start by hand runs for a while and then ends by itself
+	weather.timer = randRange(CONFIG.STORM_BUTTON_MIN, CONFIG.STORM_BUTTON_MAX)
 end
 
 local function forceBleed()
@@ -1126,7 +1184,162 @@ local function forceBleed()
 end
 
 --------------------------------------------------------------------------------
--- 4. GUI CREATION (BOTTOM RIGHT HUD)
+-- 3c. STANCES (stand / crouch / crawl / sit)
+--------------------------------------------------------------------------------
+-- R15 avatars: the legs bend through the hip/knee joints, the torso leans through the root
+-- joint, and the body height drops through HipHeight. R6 avatars only get a lower camera
+-- and slower movement. Only your own client sees the pose.
+
+-- Rotates a joint's C0 about its own pivot, in the parent part's space
+stance.rotatedC0 = function(base, rotation)
+	local p = base.Position
+	return CFrame.new(p) * rotation * CFrame.new(-p) * base
+end
+
+-- Puts every joint, the hip height and the jump back exactly as they were
+stance.restore = function()
+	for _, j in pairs(stance.joints) do
+		if j.motor and j.motor.Parent then j.motor.C0 = j.base end
+	end
+
+	local char = stance.char
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum and stance.ready then
+		if stance.r15 then hum.HipHeight = stance.baseHip end
+		hum.JumpPower = stance.baseJumpPower
+		hum.JumpHeight = stance.baseJumpHeight
+	end
+
+	stance.mode = "stand"
+	local c = stance.cur
+	c.thigh, c.knee, c.pitch, c.rootDrop = 0, 0, 0, 0
+	c.speed, c.quiet, c.camDrop = 1, 1, 0
+	c.hip = stance.baseHip
+end
+
+-- Reads the avatar's joints and remembers how they look standing up
+stance.setup = function(char)
+	stance.ready = false
+	stance.char = char
+	stance.joints = {}
+
+	local humanoid = char:WaitForChild("Humanoid", 5)
+	if not humanoid then return end
+
+	stance.r15 = humanoid.RigType == Enum.HumanoidRigType.R15
+	if stance.r15 then
+		for _, name in ipairs({ "LowerTorso", "LeftUpperLeg", "LeftLowerLeg", "RightUpperLeg", "RightLowerLeg" }) do
+			char:WaitForChild(name, 5)
+		end
+		local names = { root = "RootJoint", lHip = "LeftHip", rHip = "RightHip", lKnee = "LeftKnee", rKnee = "RightKnee" }
+		for key, name in pairs(names) do
+			local motor = char:FindFirstChild(name, true)
+			if motor and motor:IsA("Motor6D") then
+				stance.joints[key] = { motor = motor, base = motor.C0 }
+			end
+		end
+		local upper = char:FindFirstChild("LeftUpperLeg")
+		local lower = char:FindFirstChild("LeftLowerLeg")
+		stance.legUpper = upper and upper.Size.Y or 1
+		stance.legLower = lower and lower.Size.Y or 1
+	end
+
+	if LocalPlayer.Character ~= char then return end
+	stance.baseHip = humanoid.HipHeight
+	stance.baseJumpPower = humanoid.JumpPower
+	stance.baseJumpHeight = humanoid.JumpHeight
+	stance.mode = "stand"
+	local c = stance.cur
+	c.thigh, c.knee, c.pitch, c.rootDrop = 0, 0, 0, 0
+	c.speed, c.quiet, c.camDrop = 1, 1, 0
+	c.hip = stance.baseHip
+	stance.ready = true
+end
+
+-- Runs every render frame: eases toward the current stance and writes the pose
+stance.apply = function(dt, character, humanoid)
+	if not stance.ready or stance.char ~= character then return end
+
+	local def = CONFIG.STANCES[stance.mode] or CONFIG.STANCES.stand
+	local cur = stance.cur
+	local k = math.clamp(dt * CONFIG.STANCE_BLEND_SPEED, 0, 1)
+
+	-- Where the hips need to sit so the feet stay on the ground
+	local targetHip = stance.baseHip
+	if stance.r15 then
+		if def.hip then
+			targetHip = math.min(def.hip, stance.baseHip)
+		else
+			local thigh = math.rad(def.thigh)
+			local knee = math.rad(def.knee)
+			targetHip = stance.baseHip - (stance.legUpper * (1 - math.cos(thigh)) + stance.legLower * (1 - math.cos(thigh - knee)))
+		end
+	end
+
+	cur.thigh = cur.thigh + (def.thigh - cur.thigh) * k
+	cur.knee = cur.knee + (def.knee - cur.knee) * k
+	cur.pitch = cur.pitch + (def.pitch - cur.pitch) * k
+	cur.rootDrop = cur.rootDrop + (def.rootDrop - cur.rootDrop) * k
+	cur.hip = cur.hip + (targetHip - cur.hip) * k
+	cur.speed = cur.speed + (def.speed - cur.speed) * k
+	cur.quiet = cur.quiet + (def.quiet - cur.quiet) * k
+	cur.camDrop = cur.camDrop + ((stance.r15 and 0 or def.camDrop) - cur.camDrop) * k
+
+	if stance.r15 then
+		humanoid.HipHeight = cur.hip
+
+		local j = stance.joints
+		local thigh = CFrame.Angles(math.rad(cur.thigh), 0, 0)  -- positive swings the leg forward
+		local knee = CFrame.Angles(-math.rad(cur.knee), 0, 0)   -- negative folds the shin back
+		if j.lHip and j.lHip.motor.Parent then j.lHip.motor.C0 = stance.rotatedC0(j.lHip.base, thigh) end
+		if j.rHip and j.rHip.motor.Parent then j.rHip.motor.C0 = stance.rotatedC0(j.rHip.base, thigh) end
+		if j.lKnee and j.lKnee.motor.Parent then j.lKnee.motor.C0 = stance.rotatedC0(j.lKnee.base, knee) end
+		if j.rKnee and j.rKnee.motor.Parent then j.rKnee.motor.C0 = stance.rotatedC0(j.rKnee.base, knee) end
+		if j.root and j.root.motor.Parent then
+			-- Lean the whole body forward about the root part (this is what makes the crawl lie flat)
+			j.root.motor.C0 = CFrame.new(0, -cur.rootDrop, 0) * CFrame.Angles(-math.rad(cur.pitch), 0, 0) * j.root.base
+		end
+	end
+
+	-- No jumping out of a stance: pressing jump stands you up instead (see JumpRequest below)
+	local locked = stance.mode ~= "stand"
+	humanoid.JumpPower = locked and 0 or stance.baseJumpPower
+	humanoid.JumpHeight = locked and 0 or stance.baseJumpHeight
+end
+
+-- Switches stance. Returns false if something stopped it.
+stance.set = function(mode)
+	if mode == stance.mode then return true end
+
+	local char = LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not stance.ready or stance.char ~= char or not hum or not root or hum.Health <= 0 then return false end
+	if faint or fall.knock or ragdollData then return false end
+	if hum.FloorMaterial == Enum.Material.Air then return false end
+
+	if mode == "stand" then
+		-- Standing up needs head room
+		local need = 2.4 + math.max(0, stance.baseHip - stance.cur.hip)
+		if firstSolidHit(root.Position, Vector3.new(0, need, 0), char) then
+			showNotice("No room to stand up")
+			return false
+		end
+	end
+
+	stance.mode = mode
+	return true
+end
+
+-- Stand > Crouch > Crawl > Sit > Stand ...
+stance.cycle = function()
+	if not CONFIG.ENABLE_STANCES then return end
+	local idx = table.find(stance.order, stance.mode) or 1
+	stance.set(stance.order[idx % #stance.order + 1])
+end
+
+--------------------------------------------------------------------------------
+-- 4. GUI CREATION (HUD PANEL + BUTTONS)
 --------------------------------------------------------------------------------
 local function createHUD()
 	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -1140,113 +1353,290 @@ local function createHUD()
 	screenGui.DisplayOrder = 10 -- above the game's own GUIs
 	screenGui.Parent = playerGui
 
-	-- Version tag: if you can't see this above the bars, you're running an old copy
-	local versionTag = Instance.new("TextLabel")
-	versionTag.Name = "VersionTag"
-	versionTag.Size = UDim2.new(0, 220, 0, 18)
-	versionTag.Position = UDim2.new(1, -240, 1, -232)
-	versionTag.BackgroundTransparency = 1
-	versionTag.Text = "Realism v3"
-	versionTag.TextColor3 = Color3.fromRGB(255, 255, 255)
-	versionTag.TextStrokeTransparency = 0.5
-	versionTag.TextXAlignment = Enum.TextXAlignment.Right
-	versionTag.Font = Enum.Font.GothamBold
-	versionTag.TextSize = 12
-	versionTag.Parent = screenGui
+	-- Panel that holds the clock/weather line and every status bar
+	local panel = Instance.new("Frame")
+	panel.Name = "Panel"
+	panel.AnchorPoint = Vector2.new(1, 1)
+	panel.Position = UDim2.new(1, -110, 1, -12) -- leaves room for the mobile jump button
+	panel.Size = UDim2.new(0, 210, 0, 0)
+	panel.AutomaticSize = Enum.AutomaticSize.Y
+	panel.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+	panel.BackgroundTransparency = 0.45
+	panel.BorderSizePixel = 0
+	panel.Parent = screenGui
 
-	local hudContainer = Instance.new("Frame")
-	hudContainer.Name = "HUDContainer"
-	hudContainer.Size = UDim2.new(0, 220, 0, 190)
-	hudContainer.Position = UDim2.new(1, -240, 1, -210)
-	hudContainer.BackgroundTransparency = 1
-	hudContainer.Parent = screenGui
+	local panelCorner = Instance.new("UICorner")
+	panelCorner.CornerRadius = UDim.new(0, 10)
+	panelCorner.Parent = panel
+
+	local panelStroke = Instance.new("UIStroke")
+	panelStroke.Color = Color3.new(1, 1, 1)
+	panelStroke.Transparency = 0.85
+	panelStroke.Parent = panel
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, 8)
+	padding.PaddingBottom = UDim.new(0, 8)
+	padding.PaddingLeft = UDim.new(0, 8)
+	padding.PaddingRight = UDim.new(0, 8)
+	padding.Parent = panel
 
 	local listLayout = Instance.new("UIListLayout")
 	listLayout.SortOrder = Enum.SortOrder.LayoutOrder
-	listLayout.Padding = UDim.new(0, 6)
-	listLayout.Parent = hudContainer
+	listLayout.Padding = UDim.new(0, 5)
+	listLayout.Parent = panel
 
-	local function makeBar(name, color, layoutOrder)
-		local bg = Instance.new("Frame")
-		bg.Name = name .. "BG"
-		bg.Size = UDim2.new(1, 0, 0, 18)
-		bg.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-		bg.BackgroundTransparency = 0.3
-		bg.BorderSizePixel = 0
-		bg.LayoutOrder = layoutOrder
-		bg.Parent = hudContainer
+	-- Top line: in-game clock and the weather (with a countdown while it rains)
+	local info = Instance.new("TextLabel")
+	info.Name = "Info"
+	info.Size = UDim2.new(1, 0, 0, 14)
+	info.BackgroundTransparency = 1
+	info.Text = ""
+	info.TextColor3 = Color3.fromRGB(205, 214, 228)
+	info.TextXAlignment = Enum.TextXAlignment.Left
+	info.Font = Enum.Font.GothamMedium
+	info.TextSize = 11
+	info.LayoutOrder = 0
+	info.Parent = panel
 
-		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(0, 4)
-		corner.Parent = bg
+	local versionTag = Instance.new("TextLabel")
+	versionTag.Name = "VersionTag"
+	versionTag.Size = UDim2.new(1, 0, 0, 14)
+	versionTag.BackgroundTransparency = 1
+	versionTag.Text = "Realism v4"
+	versionTag.TextColor3 = Color3.fromRGB(130, 140, 155)
+	versionTag.TextXAlignment = Enum.TextXAlignment.Right
+	versionTag.Font = Enum.Font.GothamMedium
+	versionTag.TextSize = 10
+	versionTag.Parent = info
+
+	-- One status bar: rounded track, smooth fill, optional "ghost" that trails behind drops
+	local function makeRow(name, color, order, opts)
+		opts = opts or {}
+
+		local row = Instance.new("CanvasGroup")
+		row.Name = name .. "Row"
+		row.Size = UDim2.new(1, 0, 0, 16)
+		row.BackgroundColor3 = Color3.fromRGB(28, 30, 36)
+		row.BackgroundTransparency = 0.2
+		row.BorderSizePixel = 0
+		row.LayoutOrder = order
+		row.Parent = panel
+
+		local rowCorner = Instance.new("UICorner")
+		rowCorner.CornerRadius = UDim.new(0, 5)
+		rowCorner.Parent = row
+
+		local ghost
+		if opts.ghost then
+			ghost = Instance.new("Frame")
+			ghost.Name = "Ghost"
+			ghost.Size = UDim2.new(1, 0, 1, 0)
+			ghost.BackgroundColor3 = Color3.new(1, 1, 1)
+			ghost.BackgroundTransparency = 0.55
+			ghost.BorderSizePixel = 0
+			ghost.Parent = row
+		end
 
 		local fill = Instance.new("Frame")
 		fill.Name = "Fill"
 		fill.Size = UDim2.new(1, 0, 1, 0)
 		fill.BackgroundColor3 = color
 		fill.BorderSizePixel = 0
-		fill.Parent = bg
+		fill.Parent = row
 
-		local fillCorner = Instance.new("UICorner")
-		fillCorner.CornerRadius = UDim.new(0, 4)
-		fillCorner.Parent = fill
+		local shine = Instance.new("UIGradient")
+		shine.Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(185, 185, 185))
+		shine.Rotation = 90
+		shine.Parent = fill
 
 		local label = Instance.new("TextLabel")
 		label.Name = "Label"
-		label.Size = UDim2.new(1, -10, 1, 0)
+		label.Size = UDim2.new(0.6, 0, 1, 0)
 		label.Position = UDim2.new(0, 8, 0, 0)
 		label.BackgroundTransparency = 1
 		label.Text = name:upper()
-		label.TextColor3 = Color3.fromRGB(255, 255, 255)
+		label.TextColor3 = Color3.new(1, 1, 1)
+		label.TextStrokeTransparency = 0.7
 		label.TextXAlignment = Enum.TextXAlignment.Left
 		label.Font = Enum.Font.GothamBold
-		label.TextSize = 11
-		label.Parent = bg
+		label.TextSize = 10
+		label.Parent = row
 
-		return fill, bg
+		local value = Instance.new("TextLabel")
+		value.Name = "Value"
+		value.Size = UDim2.new(0.4, -8, 1, 0)
+		value.Position = UDim2.new(0.6, 0, 0, 0)
+		value.BackgroundTransparency = 1
+		value.Text = ""
+		value.TextColor3 = Color3.new(1, 1, 1)
+		value.TextStrokeTransparency = 0.7
+		value.TextXAlignment = Enum.TextXAlignment.Right
+		value.Font = Enum.Font.GothamBold
+		value.TextSize = 10
+		value.Parent = row
+
+		return {
+			row = row, fill = fill, ghost = ghost, label = label, value = value,
+			color = color,
+			warn = opts.warn,        -- pulses when nearly empty
+			idle = opts.idle or 1,   -- opacity while "not needed"
+			disp = 1, ghostDisp = 1, alpha = 1,
+			lastText = nil,
+		}
 	end
 
-	local healthFill = makeBar("Health", CONFIG.HEALTH_COLOR, 1)
-	local hungerFill = makeBar("Hunger", CONFIG.HUNGER_COLOR, 2)
-	local thirstFill = makeBar("Thirst", CONFIG.THIRST_COLOR, 3)
-	local sprintFill = makeBar("Sprint", CONFIG.SPRINT_COLOR, 4)
-	local adrenalineFill, adrenalineBG = makeBar("Adrenaline", CONFIG.ADRENALINE_COLOR, 5)
-	local strengthFill = makeBar("Leg Strength", CONFIG.STRENGTH_COLOR, 6)
-	local bleedFill, bleedBG = makeBar("Bleeding", CONFIG.BLEED_COLOR, 7)
-	local tempFill, tempBG = makeBar("Temperature", CONFIG.COLD_COLOR, 8)
-	local tempLabel = tempBG:FindFirstChild("Label")
+	local rows = {
+		health = makeRow("Health", CONFIG.HEALTH_COLOR, 1, { ghost = true, warn = true }),
+		hunger = makeRow("Hunger", CONFIG.HUNGER_COLOR, 2, { warn = true }),
+		thirst = makeRow("Thirst", CONFIG.THIRST_COLOR, 3, { warn = true }),
+		sprint = makeRow("Sprint", CONFIG.SPRINT_COLOR, 4, { warn = true, idle = 0.4 }),
+		strength = makeRow("Leg Strength", CONFIG.STRENGTH_COLOR, 5, { idle = 0.5 }),
+		adrenaline = makeRow("Adrenaline", CONFIG.ADRENALINE_COLOR, 6),
+		bleed = makeRow("Bleeding", CONFIG.BLEED_COLOR, 7),
+		temp = makeRow("Temperature", CONFIG.COLD_COLOR, 8),
+	}
+	rows.adrenaline.row.Visible = false
+	rows.bleed.row.Visible = false
+	rows.temp.row.Visible = false
 
-	adrenalineBG.Visible = false
-	bleedBG.Visible = false
-	tempBG.Visible = false
+	-- Eases a bar toward its value, pulses it when low, and dims it while it isn't needed
+	local function setBar(r, frac, dt, text, needed)
+		frac = math.clamp(frac, 0, 1)
+		r.disp = r.disp + (frac - r.disp) * math.clamp(dt * 10, 0, 1)
+		r.fill.Size = UDim2.new(r.disp, 0, 1, 0)
+
+		if r.ghost then
+			if r.ghostDisp < frac then
+				r.ghostDisp = frac
+			else
+				r.ghostDisp = r.ghostDisp + (frac - r.ghostDisp) * math.clamp(dt * 1.5, 0, 1)
+			end
+			r.ghost.Size = UDim2.new(r.ghostDisp, 0, 1, 0)
+		end
+
+		local shown = text or tostring(math.floor(frac * 100 + 0.5))
+		if shown ~= r.lastText then
+			r.lastText = shown
+			r.value.Text = shown
+		end
+
+		if r.warn and frac < 0.2 then
+			local pulse = 0.5 + 0.5 * math.sin(os.clock() * 7)
+			r.fill.BackgroundColor3 = r.color:Lerp(Color3.new(1, 1, 1), pulse * 0.5)
+		else
+			r.fill.BackgroundColor3 = r.color
+		end
+
+		local target = needed and 1 or r.idle
+		r.alpha = r.alpha + (target - r.alpha) * math.clamp(dt * 4, 0, 1)
+		r.row.GroupTransparency = 1 - r.alpha
+	end
+
+	local hud = {
+		rows = rows,
+		-- main loop fills these in every frame, then calls update()
+		values = {
+			health = 1, hunger = 1, thirst = 1, sprint = 1, sprinting = false, strength = 0,
+			adrenaline = 0, bleed = 0, bandaging = false, temp = 0,
+		},
+		lastInfo = nil,
+	}
+
+	local function formatTime(seconds)
+		seconds = math.max(0, math.floor(seconds))
+		return string.format("%d:%02d", math.floor(seconds / 60), seconds % 60)
+	end
+
+	hud.update = function(dt)
+		local v = hud.values
+
+		setBar(rows.health, v.health, dt, nil, true)
+		setBar(rows.hunger, v.hunger, dt, nil, true)
+		setBar(rows.thirst, v.thirst, dt, nil, true)
+		setBar(rows.sprint, v.sprint, dt, nil, v.sprint < 0.995 or v.sprinting)
+		setBar(rows.strength, v.strength, dt, nil, false)
+
+		local showAdrenaline = v.adrenaline > 0.001
+		rows.adrenaline.row.Visible = showAdrenaline
+		if showAdrenaline then setBar(rows.adrenaline, v.adrenaline, dt, nil, true) end
+
+		local showBleed = v.bleed > 0.001
+		rows.bleed.row.Visible = showBleed
+		if showBleed then
+			rows.bleed.color = v.bandaging and CONFIG.BANDAGE_COLOR or CONFIG.BLEED_COLOR
+			rows.bleed.label.Text = v.bandaging and "WRAPPING" or "BLEEDING"
+			setBar(rows.bleed, v.bleed, dt, "", true)
+		end
+
+		local tempAmount = math.abs(v.temp)
+		local showTemp = tempAmount > 0.15
+		rows.temp.row.Visible = showTemp
+		if showTemp then
+			rows.temp.color = v.temp < 0 and CONFIG.COLD_COLOR or CONFIG.HEAT_COLOR
+			rows.temp.label.Text = v.temp < 0 and "COLD" or "HEAT"
+			setBar(rows.temp, tempAmount, dt, nil, true)
+		end
+
+		-- Clock and weather. While it rains you can see exactly how long is left.
+		local clock = Lighting.ClockTime
+		local hours = math.floor(clock)
+		local minutes = math.floor((clock - hours) * 60)
+		local weatherText
+		if weather.rain > 0.03 then
+			if weather.target > 0 then
+				weatherText = "RAIN " .. formatTime(weather.timer)
+			else
+				weatherText = "CLEARING"
+			end
+		else
+			weatherText = "CLEAR"
+		end
+		local text = string.format("%02d:%02d   %s", hours, minutes, weatherText)
+		if text ~= hud.lastInfo then
+			hud.lastInfo = text
+			info.Text = text
+		end
+
+		if stance.button and stance.lastLabel ~= stance.mode then
+			stance.lastLabel = stance.mode
+			stance.button.Text = stance.mode:upper()
+		end
+	end
+
+	-- Round button used for RUN and STANCE
+	local function makeRoundButton(name, text, position, strokeColor)
+		local b = Instance.new("TextButton")
+		b.Name = name
+		b.Size = UDim2.new(0, 65, 0, 65)
+		b.Position = position
+		b.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+		b.BackgroundTransparency = 0.3
+		b.Text = text
+		b.TextColor3 = Color3.new(1, 1, 1)
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 13
+		b.AutoButtonColor = false
+		b.Parent = screenGui
+
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(1, 0)
+		c.Parent = b
+
+		local s = Instance.new("UIStroke")
+		s.Color = strokeColor
+		s.Thickness = 2.5
+		s.Parent = b
+		return b
+	end
 
 	-- Mobile touch sprint button (hold to run)
 	if UserInputService.TouchEnabled then
-		local mobileBtn = Instance.new("TextButton")
-		mobileBtn.Name = "MobileSprintButton"
-		mobileBtn.Size = UDim2.new(0, 65, 0, 65)
-		mobileBtn.Position = UDim2.new(1, -95, 1, -295)
-		mobileBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-		mobileBtn.BackgroundTransparency = 0.3
-		mobileBtn.Text = "RUN"
-		mobileBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-		mobileBtn.Font = Enum.Font.GothamBold
-		mobileBtn.TextSize = 14
-		mobileBtn.AutoButtonColor = false
-		mobileBtn.Parent = screenGui
-
-		local btnCorner = Instance.new("UICorner")
-		btnCorner.CornerRadius = UDim.new(1, 0)
-		btnCorner.Parent = mobileBtn
-
-		local btnStroke = Instance.new("UIStroke")
-		btnStroke.Color = CONFIG.SPRINT_COLOR
-		btnStroke.Thickness = 2.5
-		btnStroke.Parent = mobileBtn
+		local mobileBtn = makeRoundButton("MobileSprintButton", "RUN", UDim2.new(1, -95, 1, -295), CONFIG.SPRINT_COLOR)
 
 		local function setPressedLook(pressed)
 			mobileBtn.BackgroundColor3 = pressed and CONFIG.SPRINT_COLOR or Color3.fromRGB(30, 30, 30)
-			mobileBtn.TextColor3 = pressed and Color3.fromRGB(20, 20, 20) or Color3.fromRGB(255, 255, 255)
+			mobileBtn.TextColor3 = pressed and Color3.fromRGB(20, 20, 20) or Color3.new(1, 1, 1)
 		end
 
 		local sprintInput = nil
@@ -1267,6 +1657,16 @@ local function createHUD()
 				setPressedLook(false)
 			end
 		end))
+	end
+
+	-- Stance button: tap to cycle Stand > Crouch > Crawl > Sit (PC: press C)
+	if CONFIG.ENABLE_STANCES then
+		local stanceBtn = makeRoundButton("StanceButton", "STAND", UDim2.new(1, -170, 1, -295), Color3.fromRGB(120, 180, 255))
+		stanceBtn.Activated:Connect(function()
+			safeCall("stance", stance.cycle)
+		end)
+		stance.button = stanceBtn
+		stance.lastLabel = "stand"
 	end
 
 	if CONFIG.TEST_BUTTONS then
@@ -1306,24 +1706,10 @@ local function createHUD()
 		end)
 	end
 
-	return {
-		Health = healthFill,
-		Hunger = hungerFill,
-		Thirst = thirstFill,
-		Sprint = sprintFill,
-		Strength = strengthFill,
-		Adrenaline = adrenalineFill,
-		AdrenalineBG = adrenalineBG,
-		Bleeding = bleedFill,
-		BleedingBG = bleedBG,
-		Temp = tempFill,
-		TempBG = tempBG,
-		TempLabel = tempLabel,
-	}
+	return hud
 end
 
 local bars = createHUD()
-
 --------------------------------------------------------------------------------
 -- 4b. INJURY VIGNETTE (red glow around the screen edges)
 --------------------------------------------------------------------------------
@@ -1693,7 +2079,8 @@ local function playFootstep(sound, humanoid, isRunning, speedT, puddle)
 	end
 	if sound.SoundId ~= id then sound.SoundId = id end
 	sound.PlaybackSpeed = (isRunning and 1.2 or 0.95) + math.random() * 0.15 + speedT * 0.2
-	sound.Volume = isRunning and 0.85 or 0.45
+	-- Crouching and crawling are quieter (stance.cur.quiet eases between stances)
+	sound.Volume = (isRunning and 0.85 or 0.45) * stance.cur.quiet
 	sound.TimePosition = CONFIG.FOOTSTEP_CLIP_START
 	sound:Play()
 
@@ -1854,6 +2241,9 @@ local function startRagdoll(character, topple)
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
 	local hrp = character:FindFirstChild("HumanoidRootPart")
 	if not humanoid then return end
+
+	-- Straighten out of any crouch/crawl/sit first, so the joints are built from the standing pose
+	stance.restore()
 
 	local data = {
 		instances = {},
@@ -2217,7 +2607,6 @@ local function updateBlood(dt, character, humanoid, hrp)
 		bloodGrowTimer = 0
 	end
 end
-
 --------------------------------------------------------------------------------
 -- 6f. SCREEN DROPS (rain water + blood), RAIN, LIGHTNING & WEATHER
 --------------------------------------------------------------------------------
@@ -2289,7 +2678,13 @@ local function createRainStreaks()
 	rig.Size = Vector3.new(1, 1, 1)
 	rig.Parent = Workspace
 
-	for _ = 1, CONFIG.RAIN_STREAKS do
+	-- Phones and tablets get half as many streaks (every streak is updated every frame)
+	local streakCount = CONFIG.RAIN_STREAKS
+	if UserInputService.TouchEnabled then
+		streakCount = math.floor(streakCount / 2)
+	end
+
+	for _ = 1, streakCount do
 		local top = Instance.new("Attachment")
 		top.Parent = rig
 		local bottom = Instance.new("Attachment")
@@ -2513,7 +2908,7 @@ local function updateWeather(dt, character)
 		return
 	end
 
-	-- Schedule: dry spell -> shower -> dry spell ...
+	-- Schedule: dry spell -> shower -> dry spell ... (every shower ends when its timer runs out)
 	w.timer = w.timer - dt
 	if w.timer <= 0 then
 		if w.target > 0 then
@@ -2879,7 +3274,8 @@ local function mainUpdate(deltaTime)
 				(peakFallSpeed - CONFIG.FALL_DAMAGE_MIN_SPEED) / (CONFIG.FALL_DAMAGE_LETHAL_SPEED - CONFIG.FALL_DAMAGE_MIN_SPEED),
 				0, 1
 			)
-			humanoid:TakeDamage(humanoid.MaxHealth * severity)
+			-- Set health directly like every other damage source here (TakeDamage can do nothing from a LocalScript)
+			humanoid.Health = math.max(0, humanoid.Health - humanoid.MaxHealth * severity)
 		end
 
 		-- Fall injuries: stumble, then a sprained ankle, then a knockdown
@@ -2913,11 +3309,11 @@ local function mainUpdate(deltaTime)
 		adrenaline = math.clamp(adrenaline - (CONFIG.ADRENALINE_DECAY * deltaTime), 0, 100)
 	end
 
-	-- C2. Sprint & stamina
+	-- C2. Sprint & stamina (you can only sprint while standing)
 	local flatVelocity = Vector3.new(hrp.AssemblyLinearVelocity.X, 0, hrp.AssemblyLinearVelocity.Z)
 	local isMoving = flatVelocity.Magnitude > 1.5
 	local isAdrenalineActive = adrenaline > 1
-	local wantsToSprint = (shiftPressed or mobileSprinting) and isMoving
+	local wantsToSprint = (shiftPressed or mobileSprinting) and isMoving and stance.mode == "stand"
 
 	if stamina <= 0 then
 		exhausted = true
@@ -2929,7 +3325,9 @@ local function mainUpdate(deltaTime)
 
 	if isSprinting then
 		local drainMultiplier = isAdrenalineActive and CONFIG.ADRENALINE_STAMINA_DRAIN_MULT or 1
-		stamina = math.clamp(stamina - (CONFIG.STAMINA_DRAIN_RATE * drainMultiplier * (1 + heatAmt * CONFIG.TEMP_HOT_SPRINT_DRAIN) * deltaTime), 0, CONFIG.MAX_STAMINA)
+		-- Heat drains you faster; strong legs make the sprint last longer
+		local fitness = 1 - CONFIG.STAMINA_FITNESS_BONUS * (legStrength / 100)
+		stamina = math.clamp(stamina - (CONFIG.STAMINA_DRAIN_RATE * drainMultiplier * fitness * (1 + heatAmt * CONFIG.TEMP_HOT_SPRINT_DRAIN) * deltaTime), 0, CONFIG.MAX_STAMINA)
 	else
 		-- Walking barely recovers stamina; standing still recovers it quickly
 		local regen = isMoving and CONFIG.STAMINA_REGEN_WALK or CONFIG.STAMINA_REGEN_RATE
@@ -2960,8 +3358,8 @@ local function mainUpdate(deltaTime)
 		legStrength = math.clamp(legStrength + gain * deltaTime, 0, 100)
 	end
 
-	-- C4. Mantling
-	if not faint and not fall.knock then
+	-- C4. Mantling (only from a standing position)
+	if not faint and not fall.knock and stance.mode == "stand" then
 		safeCall("mantle", updateMantle, deltaTime, humanoid, hrp, character)
 	end
 
@@ -3044,6 +3442,9 @@ local function mainUpdate(deltaTime)
 		targetSpeed = targetSpeed * CONFIG.BANDAGE_MOVE_MULT
 	end
 
+	-- Crouching, crawling and sitting slow you down (stance.cur.speed eases between stances)
+	targetSpeed = targetSpeed * stance.cur.speed
+
 	humanoid.WalkSpeed = targetSpeed
 	Camera.FieldOfView = Camera.FieldOfView + (targetFOV - Camera.FieldOfView) * math.clamp(deltaTime * 5, 0, 1)
 
@@ -3117,48 +3518,28 @@ local function mainUpdate(deltaTime)
 	dof.FocusDistance = focusDistance
 	dof.InFocusRadius = math.clamp(focusDistance * 0.6, 8, 60)
 
-	-- G. HUD bars (set directly; no per-frame tweens)
-	bars.Health.Size = UDim2.new(healthPercent, 0, 1, 0)
-	bars.Hunger.Size = UDim2.new(hunger / 100, 0, 1, 0)
-	bars.Thirst.Size = UDim2.new(thirst / 100, 0, 1, 0)
-	bars.Sprint.Size = UDim2.new(stamina / CONFIG.MAX_STAMINA, 0, 1, 0)
-	bars.Strength.Size = UDim2.new(legStrength / 100, 0, 1, 0)
-
-	if adrenaline > 0.1 then
-		bars.AdrenalineBG.Visible = true
-		bars.Adrenaline.Size = UDim2.new(adrenaline / 100, 0, 1, 0)
-	else
-		bars.AdrenalineBG.Visible = false
-	end
-
-	-- Bleeding bar: red while bleeding, pale and draining while a bandage is being wrapped
+	-- G. HUD (the panel eases the bars, pulses low ones and shows clock/weather)
+	local hudValues = bars.values
+	hudValues.health = healthPercent
+	hudValues.hunger = hunger / 100
+	hudValues.thirst = thirst / 100
+	hudValues.sprint = stamina / CONFIG.MAX_STAMINA
+	hudValues.sprinting = isSprinting
+	hudValues.strength = legStrength / 100
+	hudValues.adrenaline = adrenaline / 100
+	hudValues.temp = temp.body
+	hudValues.bandaging = bandaging
 	if bleedSeverity > 0 then
-		bars.BleedingBG.Visible = true
+		-- While a bandage is being wrapped the bar drains toward empty
 		local shown = bleedSeverity
 		if bandaging then
-			local progress = math.clamp((os.clock() - bandageStart) / CONFIG.BANDAGE_USE_TIME, 0, 1)
-			shown = bleedSeverity * (1 - progress)
-			bars.Bleeding.BackgroundColor3 = CONFIG.BANDAGE_COLOR
-		else
-			bars.Bleeding.BackgroundColor3 = CONFIG.BLEED_COLOR
+			shown = bleedSeverity * (1 - math.clamp((os.clock() - bandageStart) / CONFIG.BANDAGE_USE_TIME, 0, 1))
 		end
-		bars.Bleeding.Size = UDim2.new(shown, 0, 1, 0)
+		hudValues.bleed = shown
 	else
-		bars.BleedingBG.Visible = false
+		hudValues.bleed = 0
 	end
-
-	-- Temperature bar: only shows when you're noticeably cold or hot
-	local tempAmt = math.abs(temp.body)
-	if tempAmt > 0.15 then
-		bars.TempBG.Visible = true
-		bars.Temp.Size = UDim2.new(tempAmt, 0, 1, 0)
-		bars.Temp.BackgroundColor3 = temp.body < 0 and CONFIG.COLD_COLOR or CONFIG.HEAT_COLOR
-		if bars.TempLabel then
-			bars.TempLabel.Text = temp.body < 0 and "COLD" or "HOT"
-		end
-	else
-		bars.TempBG.Visible = false
-	end
+	safeCall("hud", bars.update, deltaTime)
 
 	-- H. Day / night cycle
 	if CONFIG.ENABLE_DAY_NIGHT then
@@ -3227,6 +3608,15 @@ local function resetStateForNewCharacter()
 	fall.stumbleT, fall.roll = 0, 0
 	fall.sprainLeft, fall.sprainStrength = 0, 0
 	fall.knock = nil
+
+	-- Standing again (the new character's joints are read in stance.setup)
+	stance.ready = false
+	stance.char = nil
+	stance.joints = {}
+	stance.mode = "stand"
+	local c = stance.cur
+	c.thigh, c.knee, c.pitch, c.rootDrop = 0, 0, 0, 0
+	c.speed, c.quiet, c.camDrop = 1, 1, 0
 end
 
 -- Each system starts on its own, so one failing never stops the others
@@ -3234,6 +3624,7 @@ local function initCharacter(char)
 	safeCall("first-person setup", setupFirstPersonAndBobbing, char)
 	task.spawn(safeCall, "gear creation", createClientGears)
 	task.spawn(safeCall, "sound setup", setupSounds, char)
+	task.spawn(safeCall, "stance setup", stance.setup, char)
 end
 
 track(LocalPlayer.CharacterAdded:Connect(function(char)
@@ -3244,6 +3635,20 @@ end))
 if LocalPlayer.Character then
 	initCharacter(LocalPlayer.Character)
 end
+
+-- Stance controls: C cycles Stand > Crouch > Crawl > Sit. Jumping stands you back up.
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if CONFIG.ENABLE_STANCES and input.KeyCode == CONFIG.STANCE_KEY then
+		safeCall("stance", stance.cycle)
+	end
+end))
+
+track(UserInputService.JumpRequest:Connect(function()
+	if CONFIG.ENABLE_STANCES and stance.mode ~= "stand" then
+		safeCall("stance", stance.set, "stand")
+	end
+end))
 
 -- Test keys: G = pass out, H = empty hunger and thirst, J = start bleeding, K = toggle a storm
 if CONFIG.DEBUG_KEYS then
@@ -3266,7 +3671,7 @@ if CONFIG.DEBUG_KEYS then
 	end))
 end
 
-__toast("v3 loaded OK. Test buttons are on the left side of the screen (or press G / J / K).")
+__toast("v4 loaded OK. Stance button is above RUN (or press C). Test buttons are on the left.")
 
 --------------------------------------------------------------------------------
 -- CLEANUP (runs automatically if the script is executed again)
@@ -3275,6 +3680,9 @@ _G.RealismCleanup = function()
 	for _, c in ipairs(connections) do c:Disconnect() end
 	for _, c in ipairs(charConnections) do c:Disconnect() end
 	pcall(function() RunService:UnbindFromRenderStep(BIND_NAME) end)
+
+	-- Put the legs, hips and jump back the way they were
+	pcall(stance.restore)
 
 	for _, inst in ipairs(createdInstances) do
 		if inst and inst.Parent then
