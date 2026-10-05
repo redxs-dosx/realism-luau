@@ -4,6 +4,7 @@
 -- v2: added BLEEDING (+ Bandage tool) and WEATHER (rain, wet screen, puddles, lightning)
 -- v3: added TEMPERATURE (+ Campfire tool) and FALL INJURIES (stumble, sprained ankle, knockdown)
 -- v4: longer sprint, STANCES (crouch / sit / crawl button), randomized weather, new HUD
+-- v5: SKY (twilight palette, stars, sun/moon size, clouds, storm clouds)
 -- v4 stance fix: real leg geometry, torso leans about the hips, camera follows the real head
 
 local __toasts = 0
@@ -1584,7 +1585,7 @@ local function createHUD()
 	versionTag.Name = "VersionTag"
 	versionTag.Size = UDim2.new(1, 0, 0, 14)
 	versionTag.BackgroundTransparency = 1
-	versionTag.Text = "Realism v4"
+	versionTag.Text = "Realism v5"
 	versionTag.TextColor3 = Color3.fromRGB(130, 140, 155)
 	versionTag.TextXAlignment = Enum.TextXAlignment.Right
 	versionTag.Font = Enum.Font.GothamMedium
@@ -2103,6 +2104,161 @@ local function updateTimeOfDayLighting()
 
 	return day, golden
 end
+
+--------------------------------------------------------------------------------
+-- 6a. SKY (twilight palette, stars, sun/moon size, clouds, storm clouds)
+--------------------------------------------------------------------------------
+local sky = {
+	obj = nil,
+	clouds = nil,
+	backup = nil,
+	cloudBackup = nil,
+	cover = 0.4,
+	seed = math.random() * 1000,
+	starTimer = 0,
+	stars = -1,
+}
+
+-- Sky colour by sun height (sun direction Y: -1 midnight .. +1 noon).
+-- Each row: { sunHeight, atmosphere Color, atmosphere Decay (horizon glow), OutdoorAmbient }
+sky.palette = {
+	{ -0.30, Color3.fromRGB(20, 26, 54),    Color3.fromRGB(8, 10, 24),     Color3.fromRGB(48, 58, 95) },    -- night
+	{ -0.12, Color3.fromRGB(45, 58, 105),   Color3.fromRGB(60, 45, 90),    Color3.fromRGB(70, 78, 118) },   -- blue hour
+	{ -0.03, Color3.fromRGB(150, 130, 150), Color3.fromRGB(255, 120, 80),  Color3.fromRGB(125, 105, 115) }, -- sun on the horizon
+	{  0.06, Color3.fromRGB(200, 175, 160), Color3.fromRGB(255, 150, 85),  Color3.fromRGB(140, 112, 100) }, -- golden hour
+	{  0.22, Color3.fromRGB(190, 205, 225), Color3.fromRGB(225, 150, 100), Color3.fromRGB(125, 118, 115) },
+	{  0.55, Color3.fromRGB(180, 202, 228), Color3.fromRGB(115, 128, 145), Color3.fromRGB(110, 115, 125) }, -- day
+	{  1.00, Color3.fromRGB(170, 196, 232), Color3.fromRGB(100, 122, 148), Color3.fromRGB(110, 116, 128) }, -- noon
+}
+
+sky.sample = function(h)
+	local p = sky.palette
+	local first, last = p[1], p[#p]
+	if h <= first[1] then return first[2], first[3], first[4] end
+	if h >= last[1] then return last[2], last[3], last[4] end
+	for i = 1, #p - 1 do
+		local lo, hi = p[i], p[i + 1]
+		if h <= hi[1] then
+			local t = (h - lo[1]) / (hi[1] - lo[1])
+			return lo[2]:Lerp(hi[2], t), lo[3]:Lerp(hi[3], t), lo[4]:Lerp(hi[4], t)
+		end
+	end
+	return last[2], last[3], last[4]
+end
+
+sky.setup = function()
+	-- Sky object: reuse the game's if it has one (and remember it), else make our own
+	local s = Lighting:FindFirstChildOfClass("Sky")
+	if s and s.Name ~= "RealismSky" then
+		sky.backup = {
+			inst = s, Name = s.Name, StarCount = s.StarCount,
+			SunAngularSize = s.SunAngularSize, MoonAngularSize = s.MoonAngularSize,
+			CelestialBodiesShown = s.CelestialBodiesShown,
+		}
+	elseif not s then
+		s = trackInstance(Instance.new("Sky"))
+	else
+		trackInstance(s)
+	end
+	s.Name = "RealismSky"
+	s.CelestialBodiesShown = true
+	s.Parent = Lighting
+	sky.obj = s
+
+	-- Clouds live on Terrain
+	local terrain = Workspace:FindFirstChildOfClass("Terrain")
+	if terrain then
+		local c = terrain:FindFirstChildOfClass("Clouds")
+		if c then
+			sky.cloudBackup = { inst = c, Cover = c.Cover, Density = c.Density, Color = c.Color, Enabled = c.Enabled }
+		else
+			c = trackInstance(Instance.new("Clouds"))
+			c.Parent = terrain
+		end
+		c.Enabled = true
+		sky.clouds = c
+	end
+end
+
+sky.restore = function()
+	local b = sky.backup
+	if b and b.inst and b.inst.Parent then
+		local s = b.inst
+		s.Name, s.StarCount = b.Name, b.StarCount
+		s.SunAngularSize, s.MoonAngularSize = b.SunAngularSize, b.MoonAngularSize
+		s.CelestialBodiesShown = b.CelestialBodiesShown
+	end
+	local cb = sky.cloudBackup
+	if cb and cb.inst and cb.inst.Parent then
+		cb.inst.Cover, cb.inst.Density, cb.inst.Color, cb.inst.Enabled = cb.Cover, cb.Density, cb.Color, cb.Enabled
+	end
+end
+
+sky.update = function(dt, day, golden)
+	local s, c = sky.obj, sky.clouds
+	if not s then return end
+
+	local rain = weather.rain
+	local flash = weather.flash * (1 - weather.sheltered * 0.5)
+	local h = Lighting:GetSunDirection().Y
+	local morning = Lighting.ClockTime < 12
+
+	-- 1. Sky colour, horizon glow and ambient light from the twilight palette
+	local col, dec, amb = sky.sample(h)
+	if morning then
+		dec = dec:Lerp(Color3.fromRGB(255, 170, 180), golden * 0.3) -- sunrise glows pinker than sunset
+	end
+	if rain > 0 then
+		local grey = Color3.fromRGB(125, 132, 145):Lerp(Color3.fromRGB(30, 34, 46), 1 - day)
+		col = col:Lerp(grey, rain * 0.65)
+		dec = dec:Lerp(grey:Lerp(Color3.new(0, 0, 0), 0.35), rain * 0.6)
+		amb = amb:Lerp(grey:Lerp(Color3.new(0, 0, 0), 0.4), rain * 0.4)
+	end
+	atmosphere.Color = col
+	atmosphere.Decay = dec
+	Lighting.OutdoorAmbient = amb
+
+	-- 2. Sun and moon look bigger near the horizon
+	local sunLow = math.clamp(1 - math.abs(h) / 0.35, 0, 1)
+	local moonLow = math.clamp(1 - math.abs(-h) / 0.35, 0, 1)
+	s.SunAngularSize = 21 + sunLow * 14
+	s.MoonAngularSize = 11 + moonLow * 5
+
+	-- 3. Stars fade in after dusk and are hidden by cloud (set in steps, and not every frame)
+	sky.starTimer = sky.starTimer + dt
+	if sky.starTimer >= 0.5 then
+		sky.starTimer = 0
+		local night = math.clamp((-h - 0.05) / 0.25, 0, 1)
+		local count = math.floor(3500 * night * (1 - sky.cover * 0.9) / 250 + 0.5) * 250
+		if count ~= sky.stars then
+			sky.stars = count
+			s.StarCount = count
+		end
+	end
+
+	-- 4. Clouds: drift between clear and cloudy, build up before a shower, go dark in rain
+	if c then
+		local n = math.noise(os.clock() * 0.004, sky.seed, 0) -- slow wandering value
+		local base = math.clamp(0.38 + n * 0.5, 0.15, 0.7)
+		local pre = 0
+		if CONFIG.ENABLE_WEATHER and weather.target == 0 and weather.timer < 50 then
+			pre = (1 - weather.timer / 50) * 0.5 -- clouds gather ~50 s before the rain
+		end
+		local coverTarget = math.clamp(math.max(base + pre, rain * 0.95), 0, 1)
+		sky.cover = sky.cover + (coverTarget - sky.cover) * math.clamp(dt * 0.5, 0, 1)
+
+		local cc = Color3.fromRGB(48, 56, 82):Lerp(Color3.new(1, 1, 1), day)
+		cc = cc:Lerp(Color3.fromRGB(255, 175, 125), golden * 0.55 * (1 - rain)) -- lit from below at dusk/dawn
+		cc = cc:Lerp(Color3.fromRGB(120, 126, 138):Lerp(Color3.fromRGB(26, 30, 40), 1 - day), rain * 0.8)
+		cc = cc:Lerp(Color3.new(1, 1, 1), flash * 0.9) -- lightning lights up the clouds
+
+		c.Cover = sky.cover
+		c.Density = math.clamp(0.4 + sky.cover * 0.25 + rain * 0.3, 0, 1)
+		c.Color = cc
+	end
+end
+
+safeCall("sky setup", sky.setup)
 
 --------------------------------------------------------------------------------
 -- 6b. AUDIO (FOOTSTEPS, BREATHING, HEARTBEAT, EAR RINGING, RAIN)
@@ -3639,6 +3795,7 @@ local function mainUpdate(deltaTime)
 	sunGlare = sunGlare + (sunTarget - sunGlare) * math.clamp(deltaTime * glareRate, 0, 1)
 
 	local day, golden = updateTimeOfDayLighting()
+	safeCall("sky", sky.update, deltaTime, day, golden)
 
 	-- Lightning blows out the screen; a roof blocks about half of it
 	local flash = weather.flash * (1 - weather.sheltered * 0.5)
@@ -3852,7 +4009,7 @@ if CONFIG.DEBUG_KEYS then
 	end))
 end
 
-__toast("v4 loaded OK. Stance button is above RUN (or press C). Test buttons are on the left.")
+__toast("v5 loaded OK. Stance button is above RUN (or press C). Test buttons are on the left.")
 
 --------------------------------------------------------------------------------
 -- CLEANUP (runs automatically if the script is executed again)
@@ -3864,6 +4021,7 @@ _G.RealismCleanup = function()
 
 	-- Put the legs, hips and jump back the way they were
 	pcall(stance.restore)
+	pcall(sky.restore)
 
 	for _, inst in ipairs(createdInstances) do
 		if inst and inst.Parent then
