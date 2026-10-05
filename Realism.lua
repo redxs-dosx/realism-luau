@@ -4,6 +4,8 @@
 -- v2: added BLEEDING (+ Bandage tool) and WEATHER (rain, wet screen, puddles, lightning)
 -- v3: added TEMPERATURE (+ Campfire tool) and FALL INJURIES (stumble, sprained ankle, knockdown)
 -- v4: longer sprint, STANCES (crouch / sit / crawl button), randomized weather, new HUD
+-- v7: LIGHTNING BOLTS, per-drop rain occlusion (rain outside windows, not inside rooms), rain on water
+-- v6: WATER (terrain water look, splashes, ripples, wake, underwater)
 -- v5: SKY (twilight palette, stars, sun/moon size, clouds, storm clouds)
 -- v4 stance fix: real leg geometry, torso leans about the hips, camera follows the real head
 
@@ -299,6 +301,9 @@ local CONFIG = {
 	LIGHTNING_MIN_RAIN = 0.75,     -- rain strength needed before lightning can strike
 	LIGHTNING_MIN_GAP = 8,         -- seconds between strikes (random min/max)
 	LIGHTNING_MAX_GAP = 25,
+	LIGHTNING_BOLTS = true,        -- draw visible bolts in the sky
+	BOLT_MIN_DIST = 120,           -- how far away bolts can strike (studs). Fog hides far ones, so lower BOLT_MAX_DIST if they look faint
+	BOLT_MAX_DIST = 480,
 	LIGHTNING_EXPOSURE = 3,        -- how blown-out the screen gets at the flash peak
 
 	-- Sun Glare
@@ -344,12 +349,12 @@ local CONFIG = {
 		"rbxassetid://1212068412",
 	},
 	HEARTBEAT_SOUND_IDS = {
-		-- "rbxassetid://YOUR_HEARTBEAT_LOOP_ID",
+		-- "rbxassetid://139826397745716",
 	},
 	-- Used when no heartbeat loop above loads: a built-in thump played on every beat
 	HEARTBEAT_FALLBACK_ID = "rbxasset://sounds/bass.wav",
 	RING_SOUND_IDS = {
-		-- "rbxassetid://YOUR_EAR_RINGING_LOOP_ID",
+		-- "rbxassetid://9069161602",
 		"rbxasset://sounds/electronicpingshort.wav", -- built-in placeholder; put a real tinnitus loop above it
 	},
 	DEBUG_KEYS = true,             -- G = pass out, H = empty hunger + thirst, J = start bleeding, K = toggle storm
@@ -1585,7 +1590,7 @@ local function createHUD()
 	versionTag.Name = "VersionTag"
 	versionTag.Size = UDim2.new(1, 0, 0, 14)
 	versionTag.BackgroundTransparency = 1
-	versionTag.Text = "Realism v5"
+	versionTag.Text = "Realism v7"
 	versionTag.TextColor3 = Color3.fromRGB(130, 140, 155)
 	versionTag.TextXAlignment = Enum.TextXAlignment.Right
 	versionTag.Font = Enum.Font.GothamMedium
@@ -2995,12 +3000,36 @@ createScreenDrops()
 local rainRig = nil
 local rainStreaks = {}
 
+-- Each drop remembers where it is in the WORLD and what is under it (roof, wall, ground or water),
+-- so rain falls outside a window but not inside the room.
+weather.rainRay = RaycastParams.new()
+weather.rainRay.FilterType = Enum.RaycastFilterType.Exclude
+weather.rainRay.IgnoreWater = false
+weather.rainChar = nil
+
 local function respawnStreak(s, y)
-	local angle = math.random() * math.pi * 2
-	local r = 1.5 + math.sqrt(math.random()) * (CONFIG.RAIN_RADIUS - 1.5)
-	s.x = math.cos(angle) * r
-	s.z = math.sin(angle) * r
-	s.y = y
+	local cp = Camera and Camera.CFrame.Position or Vector3.zero
+	local angle, reach
+	if Camera and math.random() < 0.5 then
+		-- Half the drops go in front of you, so rain beyond doors and windows is visible
+		local look = Camera.CFrame.LookVector
+		angle = math.atan2(look.Z, look.X) + (math.random() - 0.5) * 1.7
+		reach = CONFIG.RAIN_RADIUS * 1.5
+	else
+		angle = math.random() * math.pi * 2
+		reach = CONFIG.RAIN_RADIUS
+	end
+	local r = 1.5 + math.sqrt(math.random()) * (reach - 1.5)
+	s.wx = cp.X + math.cos(angle) * r
+	s.wz = cp.Z + math.sin(angle) * r
+	s.wy = cp.Y + y
+	s.floor = nil
+	local b = s.beam
+	if b then
+		-- Far drops are drawn a little wider so they stay visible
+		b.Width0 = 0.03 + r * 0.003
+		b.Width1 = 0.05 + r * 0.004
+	end
 end
 
 local function createRainStreaks()
@@ -3043,7 +3072,7 @@ local function createRainStreaks()
 
 		local s = {
 			top = top, bottom = bottom, beam = beam, on = false,
-			x = 0, y = 0, z = 0,
+			wx = 0, wy = 0, wz = 0, floor = nil, isWater = false, sleep = 0,
 			speed = CONFIG.RAIN_SPEED * (0.85 + math.random() * 0.3),
 		}
 		respawnStreak(s, math.random() * (CONFIG.RAIN_HEIGHT + 10) - 10)
@@ -3054,29 +3083,82 @@ end
 
 createRainStreaks()
 
+-- Height where this drop's column is blocked (roof, ground, water). Returns (y, hitWater)
+weather.rainFloor = function(s)
+	local reach = CONFIG.RAIN_HEIGHT + 80
+	local startY = Camera.CFrame.Position.Y + CONFIG.RAIN_HEIGHT
+	local origin = Vector3.new(s.wx, startY, s.wz)
+	for _ = 1, 3 do
+		local hit = Workspace:Raycast(origin, Vector3.new(0, -reach, 0), weather.rainRay)
+		if not hit then return startY - reach, false end
+		local inst = hit.Instance
+		if hit.Material == Enum.Material.Water then return hit.Position.Y, true end
+		-- Solid things stop rain; glass, leaves-with-no-collision and invisible parts do not
+		if inst.CanCollide and inst.Transparency < 0.5 then return hit.Position.Y, false end
+		origin = Vector3.new(s.wx, hit.Position.Y - 0.05, s.wz)
+	end
+	return origin.Y, false
+end
+
 local function updateRainStreaks(dt)
 	if not rainRig then return end
-	rainRig.CFrame = CFrame.new(Camera.CFrame.Position)
+	local cam = Camera.CFrame.Position
+	rainRig.CFrame = CFrame.new(cam)
 
-	-- How many streaks are falling right now (none under a roof)
-	local amount = weather.rain * (1 - weather.sheltered)
-	local count = math.floor(amount * #rainStreaks + 0.5)
+	local ch = LocalPlayer.Character
+	if ch ~= weather.rainChar then
+		weather.rainChar = ch
+		weather.rainRay.FilterDescendantsInstances = ch and { ch } or {}
+	end
+
+	-- How many drops are in play (a roof no longer switches them all off: each drop checks its own spot)
+	local count = math.floor(weather.rain * #rainStreaks + 0.5)
 
 	local dir = Vector3.new(CONFIG.RAIN_SLANT, -1, 0.04).Unit
 	local half = dir * (CONFIG.RAIN_LENGTH * 0.5)
+	local far2 = (CONFIG.RAIN_RADIUS * 1.7) ^ 2
+	local budget = 28 -- raycasts allowed per frame
 
 	for i, s in ipairs(rainStreaks) do
 		local show = i <= count
 		if show then
-			s.y = s.y + dir.Y * s.speed * dt
-			s.x = s.x + dir.X * s.speed * dt
-			s.z = s.z + dir.Z * s.speed * dt
-			if s.y < -10 then
-				respawnStreak(s, CONFIG.RAIN_HEIGHT)
+			if s.sleep > 0 then
+				s.sleep = s.sleep - dt
+				show = false
+			else
+				-- You walked away from this drop: bring it back around you
+				local dx, dz = s.wx - cam.X, s.wz - cam.Z
+				if dx * dx + dz * dz > far2 then respawnStreak(s, CONFIG.RAIN_HEIGHT) end
+
+				if not s.floor then
+					if budget > 0 then
+						budget = budget - 1
+						s.floor, s.isWater = weather.rainFloor(s)
+						if s.floor >= s.wy - 1 then
+							-- Roof or wall right here: no rain in this spot, try another soon
+							s.sleep = 0.3 + math.random() * 0.4
+							respawnStreak(s, math.random() * CONFIG.RAIN_HEIGHT)
+							show = false
+						end
+					else
+						show = false
+					end
+				end
+
+				if show then
+					s.wx = s.wx + dir.X * s.speed * dt
+					s.wy = s.wy + dir.Y * s.speed * dt
+					s.wz = s.wz + dir.Z * s.speed * dt
+					if s.wy <= s.floor then
+						if s.isWater and weather.onLand then weather.onLand(s.wx, s.floor, s.wz) end
+						respawnStreak(s, CONFIG.RAIN_HEIGHT)
+					else
+						local center = Vector3.new(s.wx - cam.X, s.wy - cam.Y, s.wz - cam.Z)
+						s.top.Position = center - half
+						s.bottom.Position = center + half
+					end
+				end
 			end
-			local center = Vector3.new(s.x, s.y, s.z)
-			s.top.Position = center - half
-			s.bottom.Position = center + half
 		end
 		if s.on ~= show then
 			s.on = show
@@ -3184,6 +3266,152 @@ local function pulse(t, start, peak, finish, amp)
 	return amp * (finish - t) / (finish - peak)
 end
 
+-- Visible lightning bolt: a jagged glowing line (plus branches) from the clouds to the ground.
+-- Stored as weather.* functions so no new local variables are used.
+weather.spawnBolt = function(strike)
+	if not CONFIG.LIGHTNING_BOLTS then return end
+	local cam = Camera.CFrame
+	local cp = cam.Position
+
+	-- Where it strikes: mostly somewhere in front of you so you actually see it
+	local base = math.atan2(cam.LookVector.Z, cam.LookVector.X)
+	local ang
+	if math.random() < 0.7 then
+		ang = base + (math.random() - 0.5) * 2.0
+	else
+		ang = math.random() * math.pi * 2
+	end
+	local dist = CONFIG.BOLT_MIN_DIST + (math.random() ^ 1.4) * (CONFIG.BOLT_MAX_DIST - CONFIG.BOLT_MIN_DIST)
+	local gx = cp.X + math.cos(ang) * dist
+	local gz = cp.Z + math.sin(ang) * dist
+	local hit = Workspace:Raycast(Vector3.new(gx, cp.Y + 400, gz), Vector3.new(0, -900, 0), weather.rainRay)
+	local gy = hit and hit.Position.Y or (cp.Y - 4)
+	local ground = Vector3.new(gx, gy, gz)
+	local top = Vector3.new(
+		gx + (math.random() - 0.5) * 80,
+		math.max(gy, cp.Y) + math.clamp(dist * 0.6, 130, 300) + math.random() * 40,
+		gz + (math.random() - 0.5) * 80
+	)
+
+	-- Closer strike = brighter flash, louder and sooner thunder
+	strike.dist = dist
+	strike.close = math.clamp(1 - dist / (CONFIG.BOLT_MAX_DIST * 1.2), 0, 1)
+	strike.vol = math.clamp(1.25 - dist / 650, 0.3, 1)
+	strike.thunderAt = 0.4 + dist / 150
+
+	-- Midpoint displacement: split each segment in two and nudge the middle sideways
+	local function jag(a, b, levels, amp)
+		local pts = { a, b }
+		for _ = 1, levels do
+			local nxt = { pts[1] }
+			for i = 1, #pts - 1 do
+				local p, q = pts[i], pts[i + 1]
+				local seg = q - p
+				local len = seg.Magnitude
+				local r = Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5)
+				if len > 0.001 then
+					local d = seg / len
+					r = r - d * r:Dot(d)
+				end
+				r = r.Magnitude > 0.001 and r.Unit or Vector3.xAxis
+				table.insert(nxt, (p + q) / 2 + r * len * amp)
+				table.insert(nxt, q)
+			end
+			pts = nxt
+			amp = amp * 0.85
+		end
+		return pts
+	end
+
+	if not weather.boltFolder then
+		weather.boltFolder = trackInstance(Instance.new("Folder"))
+		weather.boltFolder.Name = "RealismBolts"
+		weather.boltFolder.Parent = Workspace
+	end
+	local folder = Instance.new("Folder")
+	folder.Parent = weather.boltFolder
+	local core, glow = {}, {}
+
+	local function addLine(pts, w)
+		for i = 1, #pts - 1 do
+			local a, b = pts[i], pts[i + 1]
+			local len = (b - a).Magnitude
+			if len > 0.01 then
+				local cf = CFrame.lookAt((a + b) / 2, b)
+				for layer = 1, 2 do
+					local p = Instance.new("Part")
+					p.Anchored = true
+					p.CanCollide = false
+					p.CanQuery = false
+					p.CanTouch = false
+					p.CastShadow = false
+					p.Material = Enum.Material.Neon
+					p.Transparency = 1
+					if layer == 1 then
+						p.Color = Color3.new(1, 1, 1)
+						p.Size = Vector3.new(w, w, len)
+					else
+						p.Color = Color3.fromRGB(170, 195, 255)
+						p.Size = Vector3.new(w * 4, w * 4, len)
+					end
+					p.CFrame = cf
+					p.Parent = folder
+					table.insert(layer == 1 and core or glow, p)
+				end
+			end
+		end
+	end
+
+	local width = math.clamp(dist * 0.009, 0.6, 4.5)
+	local main = jag(top, ground, 5, 0.28)
+	addLine(main, width)
+	for _ = 1, math.random(2, 4) do
+		local start = main[math.random(4, #main - 6)]
+		local bdir = Vector3.new((math.random() - 0.5) * 1.6, -0.6 - math.random() * 0.5, (math.random() - 0.5) * 1.6).Unit
+		local blen = (top - ground).Magnitude * (0.12 + math.random() * 0.18)
+		addLine(jag(start, start + bdir * blen, 3, 0.3), width * 0.5)
+	end
+
+	-- Light on the ground where it hits
+	local lp = Instance.new("Part")
+	lp.Anchored = true
+	lp.CanCollide = false
+	lp.CanQuery = false
+	lp.CanTouch = false
+	lp.Transparency = 1
+	lp.Size = Vector3.new(1, 1, 1)
+	lp.Position = ground + Vector3.new(0, 6, 0)
+	lp.Parent = folder
+	local light = Instance.new("PointLight")
+	light.Range = 90
+	light.Brightness = 0
+	light.Color = Color3.fromRGB(190, 210, 255)
+	light.Shadows = false
+	light.Parent = lp
+
+	strike.bolt = { folder = folder, core = core, glow = glow, light = light }
+end
+
+weather.updateBolt = function(strike, a)
+	local b = strike.bolt
+	if not b then return end
+	local f = a * (0.8 + math.random() * 0.2) -- slight flicker
+	local tc = 1 - math.clamp(f * 1.2, 0, 1)
+	local tg = 1 - math.clamp(f * 0.45, 0, 1)
+	for _, p in ipairs(b.core) do p.Transparency = tc end
+	for _, p in ipairs(b.glow) do p.Transparency = tg end
+	b.light.Brightness = f * (3 + 5 * strike.close)
+	if strike.t > 0.65 then weather.clearBolt(strike) end
+end
+
+weather.clearBolt = function(strike)
+	local b = strike.bolt
+	if b then
+		strike.bolt = nil
+		if b.folder then b.folder:Destroy() end
+	end
+end
+
 -- Random strikes during heavy rain: a double flash, then thunder after a delay
 local function updateLightning(dt)
 	local w = weather
@@ -3192,7 +3420,8 @@ local function updateLightning(dt)
 	if stormy and not w.lightning then
 		w.lightningTimer = w.lightningTimer - dt
 		if w.lightningTimer <= 0 then
-			w.lightning = { t = 0, thunderAt = 0.4 + math.random() * 3.5, thundered = false }
+			w.lightning = { t = 0, thunderAt = 0.4 + math.random() * 3.5, thundered = false, dist = 250, close = 0.5, vol = 1 }
+			safeCall("lightning bolt", weather.spawnBolt, w.lightning)
 			w.lightningTimer = randRange(CONFIG.LIGHTNING_MIN_GAP, CONFIG.LIGHTNING_MAX_GAP)
 		end
 	end
@@ -3202,20 +3431,23 @@ local function updateLightning(dt)
 	if strike then
 		strike.t = strike.t + dt
 		local t = strike.t
-		flash = math.max(pulse(t, 0, 0.05, 0.28, 1), pulse(t, 0.22, 0.3, 0.6, 0.65))
+		local raw = math.max(pulse(t, 0, 0.05, 0.28, 1), pulse(t, 0.22, 0.3, 0.6, 0.65))
+		flash = raw * (0.45 + 0.55 * strike.close) -- far strikes light the whole scene less
+		if strike.bolt then safeCall("lightning bolt", weather.updateBolt, strike, raw) end
 
 		if not strike.thundered and t >= strike.thunderAt then
 			strike.thundered = true
 			if w.thunderSound then
-				w.thunderSound.Volume = CONFIG.THUNDER_VOLUME * (1 - w.sheltered * 0.5)
+				w.thunderSound.Volume = CONFIG.THUNDER_VOLUME * (1 - w.sheltered * 0.5) * strike.vol
 				w.thunderSound.PlaybackSpeed = 0.85 + math.random() * 0.3
 				w.thunderSound.TimePosition = 0
 				w.thunderSound:Play()
 			end
-			landingVelocity = landingVelocity - 0.5 -- a little camera rumble
+			landingVelocity = landingVelocity - (0.15 + 0.5 * strike.close) -- camera rumble, stronger when close
 		end
 
 		if strike.thundered and t > 0.7 then
+			weather.clearBolt(strike)
 			w.lightning = nil
 		end
 	end
@@ -3290,6 +3522,550 @@ local function updateWeather(dt, character)
 
 	w.flash = updateLightning(dt)
 end
+
+--------------------------------------------------------------------------------
+-- 6f-2. WATER (terrain water look, splashes, ripples, wake, underwater)
+--------------------------------------------------------------------------------
+-- Everything lives in ONE table so it costs a single local variable.
+-- Works on Terrain water. Water made from Parts is not touched.
+local water = {
+	cfg = {
+		ENABLE = true,
+		LOOK = true,                -- retune terrain water colour / clarity / waves with time + weather
+		UNDERWATER = true,          -- tint, fog, blur, muffled sound, bubbles under the surface
+		SPLASH_SOUND = "rbxasset://sounds/impact_water.mp3", -- built into the Roblox client
+		SPLASH_VOLUME = 0.9,
+		SPRAY_TEXTURE = "rbxasset://textures/particles/smoke_main.dds", -- built-in soft puff
+	},
+	terrain = nil,
+	snd = nil,
+	backup = nil,
+	reverbBackup = nil,
+	cur = nil,
+	applyT = 0,
+	rayParams = nil,
+	folder = nil,
+	rigs = {},
+	rigIndex = 0,
+	rings = {},
+	wakePart = nil,
+	wakeEmitter = nil,
+	camPart = nil,
+	dust = nil,
+	bubPart = nil,
+	bubbles = nil,
+	cc = nil,
+	blur = nil,
+	char = nil,
+	wasIn = nil,
+	wasUnder = false,
+	under = 0,
+	underTime = 0,
+	entryS = 0.3,
+	prevVel = Vector3.zero,
+	lastSurf = nil,
+	stepT = 0,
+	swimT = 0,
+	rainT = 0,
+	breathT = 4,
+	reverbOn = false,
+	pitters = {},
+	pitIdx = 0,
+	hitBudget = 5,
+}
+
+-- Is this point inside terrain water? Returns (true, surfaceY) or false.
+-- Terrain is read in 4-stud voxels; the voxel's fill level gives the surface height.
+water.probe = function(p)
+	local t = water.terrain
+	if not t then return false end
+	local cx = math.floor(p.X / 4) * 4
+	local cy = math.floor(p.Y / 4) * 4
+	local cz = math.floor(p.Z / 4) * 4
+	local ok, mats, occ = pcall(t.ReadVoxels, t, Region3.new(Vector3.new(cx, cy, cz), Vector3.new(cx + 4, cy + 4, cz + 4)), 4)
+	if not ok or mats[1][1][1] ~= Enum.Material.Water then return false end
+	local o = occ[1][1][1]
+	local top = cy + 4 * o
+	if p.Y >= top then return false end
+	-- Full voxel: the surface may be a few voxels higher
+	local steps = 0
+	while o >= 0.99 and steps < 6 do
+		steps = steps + 1
+		cy = cy + 4
+		local ok2, m2, o2 = pcall(t.ReadVoxels, t, Region3.new(Vector3.new(cx, cy, cz), Vector3.new(cx + 4, cy + 4, cz + 4)), 4)
+		if not ok2 or m2[1][1][1] ~= Enum.Material.Water then break end
+		o = o2[1][1][1]
+		top = cy + 4 * o
+	end
+	return true, top
+end
+
+water.part = function(name, size)
+	local p = Instance.new("Part")
+	p.Name = name
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.CastShadow = false
+	p.Transparency = 1
+	p.Size = size
+	p.Parent = water.folder
+	return p
+end
+
+water.emitter = function(part, props)
+	local e = Instance.new("ParticleEmitter")
+	e.Texture = water.cfg.SPRAY_TEXTURE
+	e.Enabled = false
+	e.Rate = 0
+	for k, v in pairs(props) do e[k] = v end
+	e.Parent = part
+	return e
+end
+
+water.makeRing = function()
+	local part = water.part("Ring", Vector3.new(1, 0.05, 1))
+	local gui = Instance.new("SurfaceGui")
+	gui.Face = Enum.NormalId.Top
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+	gui.CanvasSize = Vector2.new(200, 200)
+	gui.LightInfluence = 0.6
+	gui.Brightness = 1.4
+	gui.Enabled = false
+	gui.Parent = part
+	local f = Instance.new("Frame")
+	f.AnchorPoint = Vector2.new(0.5, 0.5)
+	f.Position = UDim2.fromScale(0.5, 0.5)
+	f.Size = UDim2.fromScale(0.94, 0.94)
+	f.BackgroundTransparency = 1
+	f.BorderSizePixel = 0
+	f.Parent = gui
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0.5, 0)
+	corner.Parent = f
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(235, 245, 255)
+	stroke.Thickness = 4
+	stroke.Transparency = 1
+	stroke.Parent = f
+	return { part = part, gui = gui, stroke = stroke, active = false, age = 0, life = 1, s0 = 1, s1 = 3, strength = 1 }
+end
+
+water.makeRig = function()
+	local part = water.part("Splash", Vector3.new(0.2, 0.2, 0.2))
+	local drops = water.emitter(part, {
+		Color = ColorSequence.new(Color3.fromRGB(235, 245, 255)),
+		Size = NumberSequence.new(0.24, 0.06),
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.1),
+			NumberSequenceKeypoint.new(0.7, 0.4),
+			NumberSequenceKeypoint.new(1, 1),
+		}),
+		Lifetime = NumberRange.new(0.55, 1.0),
+		Speed = NumberRange.new(9, 18),
+		SpreadAngle = Vector2.new(35, 35),
+		Acceleration = Vector3.new(0, -55, 0),
+		EmissionDirection = Enum.NormalId.Top,
+		LightEmission = 0.25,
+		LightInfluence = 0.7,
+		Drag = 0.4,
+	})
+	local mist = water.emitter(part, {
+		Color = ColorSequence.new(Color3.fromRGB(225, 238, 245)),
+		Size = NumberSequence.new(0.8, 3.6),
+		Transparency = NumberSequence.new(0.5, 1),
+		Lifetime = NumberRange.new(0.7, 1.2),
+		Speed = NumberRange.new(1.5, 5),
+		SpreadAngle = Vector2.new(70, 70),
+		Rotation = NumberRange.new(0, 360),
+		RotSpeed = NumberRange.new(-60, 60),
+		EmissionDirection = Enum.NormalId.Top,
+		LightInfluence = 0.9,
+		Drag = 2,
+	})
+	local snd = Instance.new("Sound")
+	snd.SoundId = water.cfg.SPLASH_SOUND
+	snd.RollOffMode = Enum.RollOffMode.InverseTapered
+	snd.RollOffMaxDistance = 90
+	snd.Parent = part
+	return { part = part, drops = drops, mist = mist, snd = snd }
+end
+
+water.setup = function()
+	local t = Workspace:FindFirstChildOfClass("Terrain")
+	water.terrain = t
+	water.snd = game:GetService("SoundService")
+	water.reverbBackup = water.snd.AmbientReverb
+
+	if t then
+		water.backup = {
+			color = t.WaterColor, clarity = t.WaterTransparency, refl = t.WaterReflectance,
+			size = t.WaterWaveSize, speed = t.WaterWaveSpeed,
+		}
+		local b = water.backup
+		water.cur = { color = b.color, clarity = b.clarity, refl = b.refl, size = b.size, speed = b.speed }
+	end
+
+	water.rayParams = RaycastParams.new()
+	water.rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	water.rayParams.IgnoreWater = false
+
+	water.folder = trackInstance(Instance.new("Folder"))
+	water.folder.Name = "RealismWater"
+	water.folder.Parent = Workspace
+
+	for _ = 1, 6 do table.insert(water.rigs, water.makeRig()) end
+	for _ = 1, 16 do table.insert(water.rings, water.makeRing()) end
+
+	-- Foam that trails behind you while wading or swimming at the surface
+	water.wakePart = water.part("Wake", Vector3.new(1.5, 0.2, 1.5))
+	water.wakeEmitter = water.emitter(water.wakePart, {
+		Color = ColorSequence.new(Color3.fromRGB(235, 245, 250)),
+		Size = NumberSequence.new(0.9, 2.8),
+		Transparency = NumberSequence.new(0.55, 1),
+		Lifetime = NumberRange.new(1.2, 1.8),
+		Speed = NumberRange.new(0.2, 0.8),
+		SpreadAngle = Vector2.new(80, 80),
+		Rotation = NumberRange.new(0, 360),
+		RotSpeed = NumberRange.new(-30, 30),
+		EmissionDirection = Enum.NormalId.Top,
+		LightInfluence = 0.9,
+		Enabled = true,
+	})
+
+	-- Floating specks around the camera (gives depth underwater) and bubbles
+	water.camPart = water.part("Dust", Vector3.new(26, 18, 26))
+	water.dust = water.emitter(water.camPart, {
+		Color = ColorSequence.new(Color3.fromRGB(190, 225, 225)),
+		Size = NumberSequence.new(0.07),
+		Transparency = NumberSequence.new(0.6),
+		Lifetime = NumberRange.new(4, 6),
+		Speed = NumberRange.new(0.1, 0.5),
+		SpreadAngle = Vector2.new(180, 180),
+		LightInfluence = 0.6,
+		Shape = Enum.ParticleEmitterShape.Box,
+		Enabled = true,
+	})
+	water.bubPart = water.part("Bubbles", Vector3.new(0.5, 0.5, 0.5))
+	water.bubbles = water.emitter(water.bubPart, {
+		Color = ColorSequence.new(Color3.fromRGB(220, 240, 245)),
+		Size = NumberSequence.new(0.15, 0.4),
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.4),
+			NumberSequenceKeypoint.new(1, 1),
+		}),
+		Lifetime = NumberRange.new(1.2, 2.4),
+		Speed = NumberRange.new(0.5, 1.5),
+		SpreadAngle = Vector2.new(25, 25),
+		Acceleration = Vector3.new(0, 4, 0),
+		EmissionDirection = Enum.NormalId.Top,
+		LightEmission = 0.4,
+		LightInfluence = 0.6,
+		Drag = 1.5,
+	})
+
+	-- Tiny crowns where raindrops hit the water (a few parts so several can pop in one frame)
+	for _ = 1, 5 do
+		local pp = water.part("Pitter", Vector3.new(0.2, 0.2, 0.2))
+		local em = water.emitter(pp, {
+			Color = ColorSequence.new(Color3.fromRGB(235, 245, 255)),
+			Size = NumberSequence.new(0.13, 0.03),
+			Transparency = NumberSequence.new(0.2, 1),
+			Lifetime = NumberRange.new(0.25, 0.4),
+			Speed = NumberRange.new(2.5, 5),
+			SpreadAngle = Vector2.new(30, 30),
+			Acceleration = Vector3.new(0, -30, 0),
+			EmissionDirection = Enum.NormalId.Top,
+			LightEmission = 0.3,
+			LightInfluence = 0.7,
+		})
+		table.insert(water.pitters, { part = pp, em = em })
+	end
+
+	-- Our own colour grading + blur for being underwater (does not touch the main grading)
+	water.cc = trackInstance(Instance.new("ColorCorrectionEffect"))
+	water.cc.Name = "RealismWaterCC"
+	water.cc.Enabled = false
+	water.cc.Parent = Lighting
+	water.blur = trackInstance(Instance.new("BlurEffect"))
+	water.blur.Name = "RealismWaterBlur"
+	water.blur.Size = 0
+	water.blur.Enabled = false
+	water.blur.Parent = Lighting
+end
+
+water.restore = function()
+	local b, t = water.backup, water.terrain
+	if b and t and t.Parent then
+		t.WaterColor = b.color
+		t.WaterTransparency = b.clarity
+		t.WaterReflectance = b.refl
+		t.WaterWaveSize = b.size
+		t.WaterWaveSpeed = b.speed
+	end
+	if water.snd and water.reverbBackup then
+		pcall(function() water.snd.AmbientReverb = water.reverbBackup end)
+	end
+end
+
+-- Ring ripple on the surface (pooled; oldest is reused when all are busy)
+water.ring = function(x, y, z, s0, s1, life, strength)
+	local pick, oldest = nil, nil
+	for _, r in ipairs(water.rings) do
+		if not r.active then
+			pick = r
+			break
+		end
+		if not oldest or r.age / r.life > oldest.age / oldest.life then oldest = r end
+	end
+	pick = pick or oldest
+	if not pick then return end
+	pick.active = true
+	pick.age = 0
+	pick.life = life
+	pick.s0 = s0
+	pick.s1 = s1
+	pick.strength = strength
+	pick.part.CFrame = CFrame.new(x, y + 0.08, z)
+	pick.part.Size = Vector3.new(s0, 0.05, s0)
+	pick.gui.Enabled = true
+end
+
+water.updateRings = function(dt)
+	for _, r in ipairs(water.rings) do
+		if r.active then
+			r.age = r.age + dt
+			local a = r.age / r.life
+			if a >= 1 then
+				r.active = false
+				r.gui.Enabled = false
+			else
+				local size = r.s0 + (r.s1 - r.s0) * (1 - (1 - a) * (1 - a))
+				r.part.Size = Vector3.new(size, 0.05, size)
+				r.stroke.Thickness = math.clamp(26 / size, 1.2, 14)
+				local alpha = (1 - a) * (1 - a) * r.strength
+				r.stroke.Transparency = 1 - alpha * 0.85
+			end
+		end
+	end
+end
+
+-- Splash at the surface. s = strength 0..1 (jumping in from height = 1, a wading step = ~0.15)
+water.splash = function(x, y, z, s, quiet)
+	water.rigIndex = water.rigIndex % #water.rigs + 1
+	local rig = water.rigs[water.rigIndex]
+	rig.part.CFrame = CFrame.new(x, y + 0.15, z)
+	rig.drops.Speed = NumberRange.new(5 + 8 * s, 10 + 16 * s)
+	rig.drops.SpreadAngle = Vector2.new(40 - 20 * s, 40 - 20 * s)
+	rig.drops:Emit(math.floor(8 + 62 * s))
+	rig.mist:Emit(math.floor(3 + 16 * s))
+
+	water.ring(x, y, z, 0.8, 3 + 7 * s, 0.9 + 0.7 * s, 0.6 + 0.4 * s)
+	if s > 0.4 then
+		water.ring(x, y, z, 0.4, 2 + 4 * s, 0.7 + 0.4 * s, 0.7)
+	end
+
+	rig.snd.Volume = water.cfg.SPLASH_VOLUME * (quiet and 0.35 or 1) * (0.3 + 0.7 * s)
+	rig.snd.PlaybackSpeed = (quiet and 1.25 or 1.1) - 0.35 * s + math.random() * 0.12
+	rig.snd:Play()
+end
+
+-- Terrain water colour, clarity, reflection and waves follow time of day and weather
+water.look = function(dt, day, golden)
+	local t, c = water.terrain, water.cur
+	if not t or not c then return end
+	local rain = weather.rain
+
+	local col = Color3.fromRGB(8, 20, 34):Lerp(Color3.fromRGB(40, 104, 112), day)
+	local storm = Color3.fromRGB(72, 90, 92):Lerp(Color3.fromRGB(18, 24, 30), 1 - day)
+	col = col:Lerp(storm, rain * 0.75)
+
+	local k = math.clamp(dt * 0.8, 0, 1)
+	c.color = c.color:Lerp(col, k)
+	c.clarity = c.clarity + ((0.78 - rain * 0.28 - (1 - day) * 0.15) - c.clarity) * k
+	c.refl = c.refl + (math.clamp(0.9 - rain * 0.35 + golden * 0.1, 0, 1) - c.refl) * k
+	c.size = c.size + ((0.16 + rain * 0.36) - c.size) * k
+	c.speed = c.speed + ((10 + rain * 9) - c.speed) * k
+
+	water.applyT = water.applyT + dt
+	if water.applyT >= 0.15 then
+		water.applyT = 0
+		t.WaterColor = c.color
+		t.WaterTransparency = c.clarity
+		t.WaterReflectance = c.refl
+		t.WaterWaveSize = c.size
+		t.WaterWaveSpeed = c.speed
+	end
+end
+
+water.update = function(dt, day, golden, humanoid, hrp)
+	local cfg = water.cfg
+	if not cfg.ENABLE or not water.terrain then return end
+	local cam = Camera
+	if not cam then return end
+
+	-- New character (respawn): forget old state
+	local char = hrp.Parent
+	if char ~= water.char then
+		water.char = char
+		water.wasIn = nil
+		water.wasUnder = false
+		water.rayParams.FilterDescendantsInstances = { char }
+	end
+
+	if cfg.LOOK then water.look(dt, day, golden) end
+	water.updateRings(dt)
+
+	local pos = hrp.Position
+	local vel = hrp.AssemblyLinearVelocity
+	local flat = Vector3.new(vel.X, 0, vel.Z).Magnitude
+
+	-- Body in water? (the root part is roughly your waist)
+	local bodyIn, bodySurf = water.probe(pos)
+	if not bodyIn and humanoid:GetState() == Enum.HumanoidStateType.Swimming then
+		bodyIn, bodySurf = true, pos.Y + 1
+	end
+	if water.wasIn == nil then water.wasIn = bodyIn end
+
+	if bodyIn and not water.wasIn then
+		-- Jumped or fell in: bigger and faster = bigger splash
+		local pv = water.prevVel
+		local s = math.clamp(0.2 + math.max(0, -pv.Y) / 55 + Vector3.new(pv.X, 0, pv.Z).Magnitude / 90, 0.2, 1)
+		water.entryS = s
+		water.splash(pos.X, bodySurf or pos.Y, pos.Z, s)
+	elseif not bodyIn and water.wasIn then
+		water.splash(pos.X, water.lastSurf or (pos.Y - 2), pos.Z, 0.22, true)
+	end
+	water.wasIn = bodyIn
+	if bodySurf then water.lastSurf = bodySurf end
+	water.prevVel = vel
+
+	-- Camera in water?
+	local camPos = cam.CFrame.Position
+	local camIn, camSurf = water.probe(camPos)
+
+	-- Wading: feet in water, body out. Splashy steps.
+	local footDrop = humanoid.RigType == Enum.HumanoidRigType.R6 and 3 or (humanoid.HipHeight + hrp.Size.Y * 0.5)
+	local feetY = pos.Y - footDrop + 0.2
+	local feetIn, feetSurf = false, nil
+	if not bodyIn then
+		feetIn, feetSurf = water.probe(Vector3.new(pos.X, feetY, pos.Z))
+	end
+	local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
+	local wading = feetIn and grounded and flat > 3
+	water.stepT = water.stepT - dt
+	if wading and water.stepT <= 0 then
+		local depth = math.clamp(feetSurf - feetY, 0, 4)
+		water.splash(pos.X, feetSurf, pos.Z, math.clamp(0.12 + flat / 70 + depth * 0.05, 0.1, 0.45), true)
+		water.stepT = math.clamp(7.5 / flat, 0.22, 0.6)
+	end
+
+	-- Foam wake + swimming ripples at the surface
+	local surfaceSwim = bodyIn and not camIn
+	local wakeRate = 0
+	if surfaceSwim and flat > 1 then
+		wakeRate = math.clamp(flat * 1.4, 3, 22)
+	elseif wading then
+		wakeRate = math.clamp(flat * 0.6, 2, 10)
+	end
+	water.wakeEmitter.Rate = wakeRate
+	if wakeRate > 0 then
+		local sy = (surfaceSwim and bodySurf) or feetSurf or pos.Y
+		water.wakePart.CFrame = CFrame.new(pos.X, sy + 0.1, pos.Z)
+	end
+	if surfaceSwim and bodySurf then
+		water.swimT = water.swimT - dt
+		if water.swimT <= 0 then
+			water.swimT = flat > 1 and 0.5 or 0.9
+			water.ring(pos.X, bodySurf, pos.Z, 1.4, 4.8, 1.5, 0.7)
+		end
+	end
+
+	water.hitBudget = 5 -- raindrop splashes allowed before the next frame (see water.rainHit)
+
+	-- Underwater look
+	if not cfg.UNDERWATER then return end
+	local u = water.under
+	u = u + ((camIn and 1 or 0) - u) * math.clamp(dt * 10, 0, 1)
+	if u < 0.01 then u = 0 end
+	water.under = u
+
+	local forward = cam.CFrame.LookVector
+	if camIn and not water.wasUnder then
+		-- Dunked: bubbles rush past the lens
+		water.bubPart.CFrame = CFrame.new(camPos + forward * 1.0 - Vector3.new(0, 0.5, 0))
+		water.bubbles:Emit(math.floor(18 + 40 * water.entryS))
+		water.breathT = 3 + math.random() * 3
+	elseif water.wasUnder and not camIn then
+		-- Surfaced: water runs down the lens
+		local n = math.clamp(math.floor(4 + water.underTime * 2), 4, 14)
+		for _ = 1, n do spawnScreenDrop(false) end
+	end
+	water.wasUnder = camIn and true or false
+	if camIn then water.underTime = water.underTime + dt else water.underTime = 0 end
+
+	if u > 0 then
+		local depth = camSurf and math.max(0, camSurf - camPos.Y) or 0
+		local dark = math.clamp(depth / 60, 0, 0.7)
+		local light = (0.25 + 0.75 * day) * (1 - dark)
+		local fog = Color3.fromRGB(34, 110, 120):Lerp(Color3.new(0, 0, 0), 1 - light)
+
+		atmosphere.Color = atmosphere.Color:Lerp(fog, u)
+		atmosphere.Decay = atmosphere.Decay:Lerp(fog, u)
+		atmosphere.Density = atmosphere.Density + (0.85 - atmosphere.Density) * u
+		atmosphere.Haze = atmosphere.Haze * (1 - u)
+
+		water.cc.Enabled = true
+		water.cc.TintColor = WHITE:Lerp(Color3.fromRGB(150, 225, 225), u)
+		water.cc.Saturation = -0.12 * u
+		water.cc.Contrast = -0.05 * u
+		water.cc.Brightness = -(0.04 + dark * 0.12) * u
+		water.blur.Enabled = true
+		water.blur.Size = 3.5 * u
+
+		water.camPart.CFrame = CFrame.new(camPos)
+		water.dust.Rate = 40 * u
+
+		if camIn then
+			water.breathT = water.breathT - dt
+			if water.breathT <= 0 then
+				water.breathT = 3 + math.random() * 3
+				water.bubPart.CFrame = CFrame.new(camPos + forward * 0.9 - Vector3.new(0, 0.4, 0))
+				water.bubbles:Emit(math.random(5, 9))
+			end
+		end
+	else
+		water.cc.Enabled = false
+		water.blur.Enabled = false
+		water.dust.Rate = 0
+	end
+
+	-- Muffled sound under the surface
+	if u > 0.5 and not water.reverbOn then
+		water.reverbOn = true
+		pcall(function() water.snd.AmbientReverb = Enum.ReverbType.UnderWater end)
+	elseif u < 0.2 and water.reverbOn then
+		water.reverbOn = false
+		pcall(function() water.snd.AmbientReverb = water.reverbBackup end)
+	end
+end
+
+-- Called by the rain when a drop lands on water: tiny ring + crown, a few per frame
+water.rainHit = function(x, y, z)
+	if water.hitBudget <= 0 or not water.cfg.ENABLE or math.random() > 0.4 then return end
+	water.hitBudget = water.hitBudget - 1
+	water.ring(x, y, z, 0.25, 1.1 + weather.rain * 0.7, 0.45 + math.random() * 0.25, 0.5)
+	water.pitIdx = water.pitIdx % #water.pitters + 1
+	local pit = water.pitters[water.pitIdx]
+	if pit then
+		pit.part.CFrame = CFrame.new(x, y + 0.05, z)
+		pit.em:Emit(2)
+	end
+end
+
+safeCall("water setup", water.setup)
+weather.onLand = function(x, y, z) water.rainHit(x, y, z) end
 
 --------------------------------------------------------------------------------
 -- 6g. TEMPERATURE
@@ -3796,6 +4572,7 @@ local function mainUpdate(deltaTime)
 
 	local day, golden = updateTimeOfDayLighting()
 	safeCall("sky", sky.update, deltaTime, day, golden)
+	safeCall("water", water.update, deltaTime, day, golden, humanoid, hrp)
 
 	-- Lightning blows out the screen; a roof blocks about half of it
 	local flash = weather.flash * (1 - weather.sheltered * 0.5)
@@ -4009,7 +4786,7 @@ if CONFIG.DEBUG_KEYS then
 	end))
 end
 
-__toast("v5 loaded OK. Stance button is above RUN (or press C). Test buttons are on the left.")
+__toast("v7 loaded OK. Stance button is above RUN (or press C). Test buttons are on the left.")
 
 --------------------------------------------------------------------------------
 -- CLEANUP (runs automatically if the script is executed again)
@@ -4022,6 +4799,7 @@ _G.RealismCleanup = function()
 	-- Put the legs, hips and jump back the way they were
 	pcall(stance.restore)
 	pcall(sky.restore)
+	pcall(water.restore)
 
 	for _, inst in ipairs(createdInstances) do
 		if inst and inst.Parent then
@@ -4103,5 +4881,8 @@ end, function(e) return debug.traceback(tostring(e), 2) end)
 
 if not __ok then
 	__toast("SCRIPT CRASHED: " .. string.match(tostring(__err), "^[^\n]*"))
+	warn(__err)
+end
+"))
 	warn(__err)
 end
