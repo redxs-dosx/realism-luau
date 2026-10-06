@@ -9,6 +9,7 @@
 -- v5: SKY (twilight palette, stars, sun/moon size, clouds, storm clouds)
 -- v4 stance fix: real leg geometry, torso leans about the hips, camera follows the real head
 -- v8: EYES (blinking, squinting at the sun), lightning-squircle test menu (all test buttons live in it now)
+-- v8.2: stances use real custom animations (Action4) and a shrinking hitbox; joint poses stay as a fallback
 
 local __toasts = 0
 local function __toast(text)
@@ -144,21 +145,27 @@ local CONFIG = {
 	--   flat: 1 = feet stay flat on the ground, 0 = feet follow the leg (toes down when crawling).
 	--   armSwing / legSwing: how far arms and legs move while you walk in that stance.
 	--   speed: walk speed multiplier (0 = can't move). quiet: footstep volume multiplier.
+	--   hit: hitbox height as a fraction of standing (the HumanoidRootPart shrinks, head and torso follow the pose).
 	--   r6 = { ... }: values that replace the ones above for R6 avatars (rigid legs, so crouch becomes a lunge).
 	ENABLE_STANCES = true,
 	STANCE_KEY = Enum.KeyCode.C,
-	STANCE_BLEND_SPEED = 5,         -- how quickly you move between stances
-	STANCE_GAIT_RATE = 2.2,         -- arm / leg swing speed while crawling
-	STANCE_ANIM_DAMP = 0.9,         -- how much of the default walk/idle animation is faded out in a stance (1 = all)
+	STANCE_BLEND_SPEED = 5,         -- how quickly the body height and hitbox move between stances
+	STANCE_FADE = 0.25,             -- seconds to blend between stance animations
+	STANCE_ANIMATIONS = true,       -- play real animations for each stance (falls back to joint poses if they won't load)
+	STANCE_HITBOX = true,           -- shrink the hitbox with the pose
+	STANCE_GAIT_RATE = 2.2,         -- arm / leg swing speed in the joint-pose fallback
+	STANCE_GAIT_STRIDE = 3,         -- studs you travel per walking-animation cycle (higher = slower stepping)
+	STANCE_ANIM_DAMP = 0.9,         -- joint-pose fallback only: how much of the default animation is faded out
 	MIN_HIP_HEIGHT = 0,             -- lowest HipHeight a stance may use; anything lower slides the body down instead
 	STANCES = {
 		stand  = {},
-		crouch = { thigh = 105, knee = 145, pitch = 20, head = 0, arm = 30, speed = 0.5, quiet = 0.45,
-			r6 = { thigh = 62, thighR = -62, knee = 0, pitch = 25 } },
-		sit    = { thigh = 140, knee = 80, pitch = 10, head = 0, arm = 40, speed = 0, quiet = 0,
+		crouch = { thigh = 105, knee = 145, pitch = 20, head = 0, arm = 30, armSwing = 10, legSwing = 12,
+			hit = 0.65, speed = 0.5, quiet = 0.45,
+			r6 = { thigh = 62, thighR = -62, knee = 0, pitch = 25, legSwing = 0 } },
+		sit    = { thigh = 140, knee = 80, pitch = 10, head = 0, arm = 40, hit = 0.45, speed = 0, quiet = 0,
 			r6 = { thigh = 90, knee = 0, pitch = 12, hipY = 0.5 } },
 		crawl  = { thigh = -90, knee = 0, pitch = 90, head = 45, arm = 90, hipY = 0.55, flat = 0,
-			armSwing = 30, legSwing = -15, speed = 0.25, quiet = 0.2 },
+			armSwing = 30, legSwing = -15, hit = 0.25, speed = 0.25, quiet = 0.2 },
 	},
 
 	-- Leg Strength
@@ -530,8 +537,16 @@ local stance = {
 	moving = 0,
 	dirty = false,           -- true while any pose is applied
 	lastCam = Vector3.zero,  -- the CameraOffset we set last frame
+	baseSize = Vector3.new(2, 2, 1), -- standing HumanoidRootPart size
+	rootName = "HumanoidRootPart",
+	tree = {},               -- [partName] = { motors that hang off that part }
+	motorKey = {},           -- [motor] = joint key
+	tracks = {},             -- [mode] = { idle = AnimationTrack, move = AnimationTrack or nil }
+	playing = nil,
+	playedAt = 0,
+	useAnim = false,         -- true when the custom animations load
 	cur = { thigh = 0, thighR = 0, knee = 0, pitch = 0, head = 0, arm = 0, flat = 1, drop = 0,
-		armSwing = 0, legSwing = 0, speed = 1, quiet = 1, amount = 0, hip = 2, camDrop = 0 },
+		armSwing = 0, legSwing = 0, speed = 1, quiet = 1, amount = 0, hip = 2, camDrop = 0, hit = 1 },
 	button = nil,
 	lastLabel = nil,
 }
@@ -1351,10 +1366,14 @@ end
 --    HipHeight 0 allows (sitting, R6 avatars), the body is slid down on its root joint instead.
 --  * Roblox's default camera follows the HumanoidRootPart, NOT your head, so lowering the body
 --    never lowered the view. stance.cameraOffset puts the camera at the real head position.
---  * The default walk / idle animations are faded out while you are in a stance.
+--  * Each stance is a real custom animation (a KeyframeSequence built in code from the pose maths),
+--    played at Action4 priority, with a walking loop for crouch and crawl. If the game won't play
+--    code-made animations, the joints are posed directly instead (see stance.apply).
+--  * The hitbox shrinks with the pose (HumanoidRootPart height), and the head / torso colliders
+--    follow the animation, so crawling really is low and sitting really is small.
 
-stance.keys = { "thigh", "thighR", "knee", "pitch", "head", "arm", "flat", "drop", "armSwing", "legSwing", "speed", "quiet" }
-stance.defaults = { thigh = 0, knee = 0, pitch = 0, head = 0, arm = 0, flat = 1, drop = 0, armSwing = 0, legSwing = 0, speed = 1, quiet = 1 }
+stance.keys = { "thigh", "thighR", "knee", "pitch", "head", "arm", "flat", "drop", "armSwing", "legSwing", "speed", "quiet", "hit" }
+stance.defaults = { thigh = 0, knee = 0, pitch = 0, head = 0, arm = 0, flat = 1, drop = 0, armSwing = 0, legSwing = 0, speed = 1, quiet = 1, hit = 1 }
 
 -- Rotates a joint's C0 about a pivot point (default: the joint itself), in the parent part's space
 stance.rotatedC0 = function(base, rotation, pivot)
@@ -1372,12 +1391,146 @@ end
 stance.resetCur = function()
 	local c = stance.cur
 	c.thigh, c.thighR, c.knee, c.pitch, c.head, c.arm = 0, 0, 0, 0, 0, 0
-	c.flat, c.drop, c.armSwing, c.legSwing = 1, 0, 0, 0
+	c.flat, c.drop, c.armSwing, c.legSwing, c.hit = 1, 0, 0, 0, 1
 	c.speed, c.quiet, c.amount, c.camDrop = 1, 1, 0, 0
 	c.hip = stance.baseHip
 end
 
--- Puts every joint, the hip height, the jump and the animations back exactly as they were
+-- The pose for one set of values: returns { jointKey = new C0 }. Used both to build the
+-- custom animations and (as a fallback) to pose the joints directly.
+-- a1 / a2 (0..1) are the two halves of the walking swing (left leg / right leg).
+stance.pose = function(v, a1, a2)
+	local lean = math.rad(v.pitch)
+	local thL = v.thigh + v.legSwing * a1
+	local thR = v.thighR + v.legSwing * a2
+	local arL = v.arm + v.armSwing * a2 -- each arm moves with the opposite leg
+	local arR = v.arm + v.armSwing * a1
+	local j = stance.joints
+	local out = {}
+
+	local function put(key, rotation, pivot)
+		local joint = j[key]
+		if joint and joint.motor.Parent then
+			out[key] = stance.rotatedC0(joint.base, rotation, pivot)
+		end
+	end
+
+	-- Torso: lean about the hips, and slide down if HipHeight can't go low enough
+	local rootJoint = j.root
+	if rootJoint and rootJoint.motor.Parent then
+		out.root = CFrame.new(0, -v.drop, 0)
+			* stance.rotatedC0(rootJoint.base, CFrame.Angles(-lean, 0, 0), stance.pivot)
+	end
+
+	-- Angles are world angles, so the torso lean is added back on top
+	put("lHip", CFrame.Angles(math.rad(thL) + lean, 0, 0))
+	put("rHip", CFrame.Angles(math.rad(thR) + lean, 0, 0))
+	if stance.r15 then
+		local knee = CFrame.Angles(-math.rad(v.knee), 0, 0)
+		put("lKnee", knee)
+		put("rKnee", knee)
+		-- Ankles cancel the leg angle so the soles stay flat on the ground (flat = 1)
+		put("lAnkle", CFrame.Angles(math.rad(v.flat * (v.knee - thL)), 0, 0))
+		put("rAnkle", CFrame.Angles(math.rad(v.flat * (v.knee - thR)), 0, 0))
+	end
+	put("lShoulder", CFrame.Angles(math.rad(arL) + lean, 0, 0))
+	put("rShoulder", CFrame.Angles(math.rad(arR) + lean, 0, 0))
+	put("neck", CFrame.Angles(lean - math.rad(v.head), 0, 0))
+	return out
+end
+
+-- Adds one Pose per joint under `parent`, following the rig's real joint tree.
+-- Joints we don't control get an identity pose, so the walk / idle animation can't leak through.
+stance.addPoses = function(parent, partName, c0s)
+	for _, motor in ipairs(stance.tree[partName] or {}) do
+		local pose = Instance.new("Pose")
+		pose.Name = motor.Part1.Name
+		local key = stance.motorKey[motor]
+		local c0 = key and c0s[key]
+		if c0 then
+			pose.CFrame = stance.joints[key].base:Inverse() * c0 -- Pose = the joint's Transform
+		end
+		pose.Weight = 1
+		pose.Parent = parent
+		stance.addPoses(pose, motor.Part1.Name, c0s)
+	end
+end
+
+-- Registers a KeyframeSequence made in code, so it can be played like an uploaded animation
+stance.register = function(ks)
+	local id = nil
+	pcall(function()
+		id = game:GetService("AnimationClipProvider"):RegisterAnimationClip(ks)
+	end)
+	if not id then
+		pcall(function()
+			id = game:GetService("KeyframeSequenceProvider"):RegisterKeyframeSequence(ks)
+		end)
+	end
+	return id
+end
+
+-- Builds one looping animation. frames = { { time, a1, a2 }, ... }
+stance.makeTrack = function(animator, name, frames, def)
+	local ok, track = pcall(function()
+		local ks = Instance.new("KeyframeSequence")
+		ks.Name = "Realism" .. name
+		ks.Loop = true
+		ks.Priority = Enum.AnimationPriority.Action4
+		for _, f in ipairs(frames) do
+			local kf = Instance.new("Keyframe")
+			kf.Time = f[1]
+			local rootPose = Instance.new("Pose")
+			rootPose.Name = stance.rootName
+			rootPose.Weight = 0
+			rootPose.Parent = kf
+			stance.addPoses(rootPose, stance.rootName, stance.pose(def, f[2], f[3]))
+			kf.Parent = ks
+		end
+
+		local id = stance.register(ks)
+		if not id then return nil end
+		local anim = Instance.new("Animation")
+		anim.Name = "RealismStance" .. name
+		anim.AnimationId = id
+		local t = animator:LoadAnimation(anim)
+		t.Priority = Enum.AnimationPriority.Action4
+		t.Looped = true
+		return t
+	end)
+	if ok then return track end
+	return nil
+end
+
+-- One idle animation per stance, plus a walking loop for stances with armSwing / legSwing
+stance.buildTracks = function(humanoid)
+	stance.tracks = {}
+	stance.playing = nil
+	stance.useAnim = false
+	if not CONFIG.STANCE_ANIMATIONS then return end
+
+	local animator = humanoid:FindFirstChildOfClass("Animator") or humanoid:WaitForChild("Animator", 3)
+	if not animator then return end
+
+	local need, got = 0, 0
+	for mode, def in pairs(stance.defs) do
+		if mode ~= "stand" then
+			need = need + 1
+			local idle = stance.makeTrack(animator, mode .. "Idle", { { 0, 0.5, 0.5 }, { 1, 0.5, 0.5 } }, def)
+			local move = nil
+			if def.armSwing ~= 0 or def.legSwing ~= 0 then
+				move = stance.makeTrack(animator, mode .. "Move", { { 0, 1, 0 }, { 0.5, 0, 1 }, { 1, 1, 0 } }, def)
+			end
+			if idle then
+				got = got + 1
+				stance.tracks[mode] = { idle = idle, move = move }
+			end
+		end
+	end
+	stance.useAnim = need > 0 and got == need
+end
+
+-- Puts every joint, the hip height, the hitbox, the jump and the animations back exactly as they were
 stance.restore = function()
 	local wasActive = stance.dirty
 
@@ -1385,16 +1538,25 @@ stance.restore = function()
 		if j.motor and j.motor.Parent then j.motor.C0 = j.base end
 	end
 
+	if stance.playing then
+		pcall(function() stance.playing:Stop(0.2) end)
+		stance.playing = nil
+	end
+
 	local char = stance.char
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	if hum and stance.ready and wasActive then
+		if hrp then hrp.Size = stance.baseSize end
 		hum.HipHeight = stance.baseHip
 		hum.JumpPower = stance.baseJumpPower
 		hum.JumpHeight = stance.baseJumpHeight
 		local animator = hum:FindFirstChildOfClass("Animator")
 		if animator then
 			for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-				track:AdjustWeight(1, 0)
+				if not string.find(track.Name, "^RealismStance") then
+					track:AdjustWeight(1, 0)
+				end
 			end
 		end
 	end
@@ -1406,12 +1568,14 @@ stance.restore = function()
 	stance.resetCur()
 end
 
--- Reads the avatar's joints and leg lengths, and works out every pose for this body
+-- Reads the avatar's joints and leg lengths, works out every pose, and builds the animations
 stance.setup = function(char)
 	stance.ready = false
 	stance.char = char
 	stance.joints = {}
 	stance.defs = {}
+	stance.tree, stance.motorKey = {}, {}
+	stance.tracks, stance.playing, stance.useAnim = {}, nil, false
 	stance.phase = 0
 	stance.moving = 0
 	stance.dirty = false
@@ -1442,8 +1606,25 @@ stance.setup = function(char)
 		local motor = char:FindFirstChild(name, true)
 		if motor and motor:IsA("Motor6D") then
 			j[key] = { motor = motor, base = motor.C0 }
+			stance.motorKey[motor] = key
 		end
 	end
+
+	-- The rig's joint tree (needed to build animations)
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("Motor6D") and d.Part0 and d.Part1 and d.Part1:IsDescendantOf(char)
+			and not d.Part1:FindFirstAncestorOfClass("Tool") and not d.Part1:FindFirstAncestorOfClass("Accessory") then
+			local list = stance.tree[d.Part0.Name]
+			if not list then
+				list = {}
+				stance.tree[d.Part0.Name] = list
+			end
+			table.insert(list, d)
+		end
+	end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	stance.rootName = hrp and hrp.Name or "HumanoidRootPart"
+	stance.baseSize = hrp and hrp.Size or Vector3.new(2, 2, 1)
 
 	-- Leg lengths straight from the rig's joints, so any avatar proportions work
 	if stance.r15 then
@@ -1507,7 +1688,53 @@ stance.setup = function(char)
 
 	stance.mode = "stand"
 	stance.resetCur()
+	stance.buildTracks(humanoid)
 	stance.ready = true
+
+	local joints = 0
+	for _ in pairs(j) do joints = joints + 1 end
+	__toast("Stances: " .. (stance.r15 and "R15" or "R6") .. ", " .. joints .. " joints, "
+		.. (stance.useAnim and "custom animations" or "joint poses (animations unavailable)"))
+end
+
+-- Plays the animation for the current stance (walking loop while moving, idle pose otherwise)
+stance.playTracks = function(flatSpeed)
+	local set = stance.mode ~= "stand" and stance.tracks[stance.mode] or nil
+	local want = nil
+	if set then
+		local limit = (stance.playing ~= nil and stance.playing == set.move) and 0.15 or 0.5
+		if set.move and stance.moving > limit then
+			want = set.move
+		else
+			want = set.idle
+		end
+	end
+
+	if want ~= stance.playing then
+		if stance.playing then stance.playing:Stop(CONFIG.STANCE_FADE) end
+		if want then
+			want:Play(CONFIG.STANCE_FADE)
+			stance.playedAt = os.clock()
+		end
+		stance.playing = want
+	end
+
+	if want and set and want == set.move then
+		want:AdjustSpeed(math.clamp(flatSpeed / CONFIG.STANCE_GAIT_STRIDE, 0.2, 3))
+	end
+
+	-- Safety net: if the animation never actually starts, fall back to posing the joints directly
+	if want and os.clock() - stance.playedAt > 1 and not want.IsPlaying then
+		stance.useAnim = false
+		stance.playing = nil
+		for _, t in pairs(stance.tracks) do
+			pcall(function()
+				t.idle:Stop(0)
+				if t.move then t.move:Stop(0) end
+			end)
+		end
+		__toast("Stance animations would not play, using joint poses instead")
+	end
 end
 
 -- Runs every render frame: eases toward the current stance and writes the pose
@@ -1534,7 +1761,6 @@ stance.apply = function(dt, character, humanoid)
 	-- Changing body height shouldn't count as a fall
 	if math.abs(def.hipHeight - cur.hip) > 0.05 then peakFallSpeed = 0 end
 
-	-- Gait: arms and legs alternate while you move (only poses with armSwing / legSwing use it)
 	local hrp = character:FindFirstChild("HumanoidRootPart")
 	local v = hrp and hrp.AssemblyLinearVelocity or Vector3.zero
 	local flatSpeed = Vector3.new(v.X, 0, v.Z).Magnitude
@@ -1544,62 +1770,46 @@ stance.apply = function(dt, character, humanoid)
 	end
 	local moveTarget = (grounded and flatSpeed > 0.5) and 1 or 0
 	stance.moving = stance.moving + (moveTarget - stance.moving) * math.clamp(dt * 8, 0, 1)
-	local s = math.sin(stance.phase) * stance.moving
-	local a1, a2 = 0.5 + 0.5 * s, 0.5 - 0.5 * s
 
-	local thL = cur.thigh + cur.legSwing * a1
-	local thR = cur.thighR + cur.legSwing * a2
-	local arL = cur.arm + cur.armSwing * a2 -- each arm moves with the opposite leg
-	local arR = cur.arm + cur.armSwing * a1
-	local lean = math.rad(cur.pitch)
+	if stance.useAnim then
+		-- The pose comes from the custom animation (it also covers the walking swing)
+		stance.playTracks(flatSpeed)
+	else
+		-- Fallback: write the joints directly, and fade the default animation out
+		local s = math.sin(stance.phase) * stance.moving
+		local c0s = stance.pose(cur, 0.5 + 0.5 * s, 0.5 - 0.5 * s)
+		for key, c0 in pairs(c0s) do
+			local joint = stance.joints[key]
+			if joint and joint.motor.Parent then joint.motor.C0 = c0 end
+		end
 
-	local j = stance.joints
-	local function put(key, rotation, pivot)
-		local joint = j[key]
-		if joint and joint.motor.Parent then
-			joint.motor.C0 = stance.rotatedC0(joint.base, rotation, pivot)
+		local animator = humanoid:FindFirstChildOfClass("Animator")
+		if animator then
+			local w = 1 - CONFIG.STANCE_ANIM_DAMP * cur.amount
+			for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+				if math.abs(track.WeightTarget - w) > 0.02 then
+					track:AdjustWeight(w, 0)
+				end
+			end
 		end
 	end
 
-	-- Torso: lean about the hips, and slide down if HipHeight can't go low enough
-	local rootJoint = j.root
-	if rootJoint and rootJoint.motor.Parent then
-		rootJoint.motor.C0 = CFrame.new(0, -cur.drop, 0)
-			* stance.rotatedC0(rootJoint.base, CFrame.Angles(-lean, 0, 0), stance.pivot)
+	-- Hitbox: the root part shrinks around its centre, and HipHeight makes up the difference
+	-- so the body stays exactly where it was. The head and torso also collide, and they now
+	-- follow the pose (leaning, sitting, lying flat).
+	local sizeY = stance.baseSize.Y
+	if CONFIG.STANCE_HITBOX and hrp then
+		sizeY = math.max(0.2, stance.baseSize.Y * cur.hit)
+		if math.abs(hrp.Size.Y - sizeY) > 0.01 then
+			hrp.Size = Vector3.new(stance.baseSize.X, sizeY, stance.baseSize.Z)
+		end
 	end
-
-	-- Angles are world angles, so the leans are added back on top of the torso lean
-	put("lHip", CFrame.Angles(math.rad(thL) + lean, 0, 0))
-	put("rHip", CFrame.Angles(math.rad(thR) + lean, 0, 0))
-	if stance.r15 then
-		local knee = CFrame.Angles(-math.rad(cur.knee), 0, 0)
-		put("lKnee", knee)
-		put("rKnee", knee)
-		-- Ankles cancel the leg angle so the soles stay flat on the ground (flat = 1)
-		put("lAnkle", CFrame.Angles(math.rad(cur.flat * (cur.knee - thL)), 0, 0))
-		put("rAnkle", CFrame.Angles(math.rad(cur.flat * (cur.knee - thR)), 0, 0))
-	end
-	put("lShoulder", CFrame.Angles(math.rad(arL) + lean, 0, 0))
-	put("rShoulder", CFrame.Angles(math.rad(arR) + lean, 0, 0))
-	put("neck", CFrame.Angles(lean - math.rad(cur.head), 0, 0))
-
-	humanoid.HipHeight = cur.hip
+	humanoid.HipHeight = cur.hip + (stance.baseSize.Y - sizeY) / 2
 
 	-- No jumping out of a stance: pressing jump stands you up instead (see JumpRequest below)
 	local locked = stance.mode ~= "stand"
 	humanoid.JumpPower = locked and 0 or stance.baseJumpPower
 	humanoid.JumpHeight = locked and 0 or stance.baseJumpHeight
-
-	-- Fade out the default walk / idle animation so it doesn't fight the pose
-	local animator = humanoid:FindFirstChildOfClass("Animator")
-	if animator then
-		local w = 1 - CONFIG.STANCE_ANIM_DAMP * cur.amount
-		for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-			if math.abs(track.WeightTarget - w) > 0.02 then
-				track:AdjustWeight(w, 0)
-			end
-		end
-	end
 end
 
 -- The default camera follows the HumanoidRootPart, so in a stance we move it onto the real head.
@@ -1721,7 +1931,7 @@ local function createHUD()
 	versionTag.Name = "VersionTag"
 	versionTag.Size = UDim2.new(1, 0, 0, 14)
 	versionTag.BackgroundTransparency = 1
-	versionTag.Text = "Realism v8"
+	versionTag.Text = "Realism v8.2"
 	versionTag.TextColor3 = Color3.fromRGB(130, 140, 155)
 	versionTag.TextXAlignment = Enum.TextXAlignment.Right
 	versionTag.Font = Enum.Font.GothamMedium
