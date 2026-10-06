@@ -544,7 +544,7 @@ local function buildFlashlight(page)
 	local b = button(page, {
 		Size = UDim2.fromScale(0.5, 0.26), Position = UDim2.fromScale(0.25, 0.22), Text = "OFF", Max = 34,
 	}, function() setFlash(not phone.flash) end)
-	make("UIAspectRatio", { AspectRatio = 1 }, b)
+	make("UIAspectRatioConstraint", { AspectRatio = 1 }, b)
 	corner(b, 0.5)
 	phone.flashBtn = b
 	phone.flashLabel = text(page, {
@@ -748,7 +748,7 @@ local function buildGui()
 		Name = "Body", AnchorPoint = Vector2.new(0.5, 1), Position = hiddenPos(),
 		Size = UDim2.fromScale(0.5, heightScale), BackgroundColor3 = COL.bezel, BorderSizePixel = 0,
 	}, gui)
-	make("UIAspectRatio", {
+	make("UIAspectRatioConstraint", {
 		AspectRatio = CONFIG.ASPECT, AspectType = Enum.AspectType.FitWithinMaxSize,
 		DominantAxis = Enum.DominantAxis.Height,
 	}, body)
@@ -914,7 +914,7 @@ end
 --------------------------------------------------------------------------------
 safeCall("build gui", buildGui)
 safeCall("start page", go, "home")
-phone.pages.home.Visible = true
+if phone.pages.home then phone.pages.home.Visible = true end
 
 track(RunService.Heartbeat:Connect(function(dt)
 	safeCall("phone loop", step, dt)
