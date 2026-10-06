@@ -517,6 +517,45 @@ local fall = {
 	knock = nil,             -- { t, dur, look } while you're knocked down
 }
 
+-- Injuries: broken bones, concussion and sprain effects. This lives inside `fall` so it costs
+-- no extra local variable. Its functions are defined in section 6i. Tune everything here.
+fall.injury = {
+	cfg = {
+		ENABLE = true,
+		BREAK_SPEED = 88,            -- landing speed where bones can start to break (a normal jump lands at ~50)
+		BREAK_CHANCE_BASE = 0.35,    -- chance at BREAK_SPEED; climbs toward 100% for the hardest falls
+		BONES_MAX = 9,               -- the most bones one fall can break
+		BONE_HEAL_SECONDS = 90,      -- every broken bone mends after this long (one at a time per body part)
+		OPEN_FRACTURE_BONES = 3,     -- breaking this many at once can start bleeding
+		CONCUSSION_SPEED = 100,      -- landing speed where a concussion can happen
+		CONCUSSION_MIN_DUR = 40,     -- seconds (mild)
+		CONCUSSION_MAX_DUR = 150,    -- seconds (severe; a severe one also knocks you out)
+		LEG_ONE_SPEED = 0.45,        -- walk speed multiplier with one broken leg
+		LEG_BOTH_SPEED = 0.18,       -- with both legs broken
+		LEG_ONE_JUMP = 0.35,         -- jump multiplier with one broken leg (both = no jump at all)
+		SPRAIN_JUMP_LOSS = 0.5,      -- a fresh sprain cuts your jump by up to this much
+		SPRAIN_SPEED_LOSS = 0.25,    -- extra slowdown from a fresh sprain, on top of the normal limp
+		SPRINT_BLOCK_SPRAIN = 0.6,   -- no sprinting while a sprain is worse than this (0 to 1)
+		RIB_DRAIN = 0.3,             -- extra sprint stamina drain per broken rib (counts up to 3)
+		RIB_REGEN_LOSS = 0.15,       -- stamina recovery lost per broken rib (counts up to 3)
+		POPUP_TIME = 4.5,            -- seconds a pop-up stays up
+		POPUP_MAX = 5,               -- most pop-ups on screen at once
+	},
+	regions = {
+		lLeg = { name = "left leg", bones = 0, timer = 0 },
+		rLeg = { name = "right leg", bones = 0, timer = 0 },
+		lArm = { name = "left arm", bones = 0, timer = 0 },
+		rArm = { name = "right arm", bones = 0, timer = 0 },
+		ribs = { name = "ribs", bones = 0, timer = 0 },
+	},
+	order = { "lLeg", "rLeg", "lArm", "rArm", "ribs" },
+	conc = { level = 0, left = 0 },
+	roll = 0, pitch = 0, yaw = 0,        -- concussion camera sway (read by the camera code)
+	blur = 0, vignette = 0, ring = 0,    -- concussion screen / audio effects
+	ui = nil, panel = nil, count = 0, popups = {}, armWarn = -100,
+	jumpScaled = false, jp0 = nil, jh0 = nil,
+}
+
 -- Stances (everything in one table; its functions are defined in section 3c).
 -- Kept in a table on purpose: Luau allows at most 200 local variables in one scope and
 -- this script was already close to that limit.
@@ -881,7 +920,7 @@ local function setupFirstPersonAndBobbing(character)
 				updateHandSway(deltaTime, character, moveSpeed, humanoid.WalkSpeed)
 				stance.apply(deltaTime, character, humanoid)
 
-				Camera.CFrame = Camera.CFrame * CFrame.Angles(0, 0, currentRoll + fall.roll)
+				Camera.CFrame = Camera.CFrame * CFrame.Angles(fall.injury.pitch, fall.injury.yaw, currentRoll + fall.roll + fall.injury.roll)
 			end
 		end
 	end
@@ -1931,7 +1970,7 @@ local function createHUD()
 	versionTag.Name = "VersionTag"
 	versionTag.Size = UDim2.new(1, 0, 0, 14)
 	versionTag.BackgroundTransparency = 1
-	versionTag.Text = "Realism v8.2"
+	versionTag.Text = "Realism v9"
 	versionTag.TextColor3 = Color3.fromRGB(130, 140, 155)
 	versionTag.TextXAlignment = Enum.TextXAlignment.Right
 	versionTag.Font = Enum.Font.GothamMedium
@@ -2291,6 +2330,10 @@ local function createHUD()
 		testButton("FALL", function()
 			if runFallTest then runFallTest(100) end
 		end)
+		testButton("BREAK", function() fall.injury.test("break") end)
+		testButton("SPRAIN", function() fall.injury.test("sprain") end)
+		testButton("CONCUSS", function() fall.injury.test("conc") end)
+		testButton("HEAL", function() fall.injury.test("heal") end)
 		testButton("BLINK", function()
 			eyes.blink(false)
 		end)
@@ -2919,7 +2962,7 @@ local function updateAudio(deltaTime, humanoid, flatSpeed, healthPercent)
 
 	-- Ear ringing: builds as sprint runs out
 	if ringSound then
-		approachVolume(ringSound, depleted * CONFIG.RING_MAX_VOLUME, deltaTime, 3)
+		approachVolume(ringSound, math.max(depleted, fall.injury.ring) * CONFIG.RING_MAX_VOLUME, deltaTime, 3)
 	end
 
 	-- Rain ambience: quieter and duller when there's a roof over you
@@ -4674,7 +4717,7 @@ local function applyFallInjuries(character, humanoid, hrp, speed)
 		)
 		fall.sprainLeft = math.max(fall.sprainLeft, CONFIG.SPRAIN_MIN_TIME + (CONFIG.SPRAIN_MAX_TIME - CONFIG.SPRAIN_MIN_TIME) * s)
 		fall.sprainStrength = math.max(fall.sprainStrength, 0.5 + 0.5 * s)
-		showNotice("You twisted your ankle")
+		fall.injury.onSprain(s)
 	end
 
 	-- Knockdown: thrown to the ground for a moment
@@ -4696,6 +4739,7 @@ runFallTest = function(speed)
 	local root = char and char:FindFirstChild("HumanoidRootPart")
 	if hum and root and hum.Health > 0 and not faint then
 		applyFallInjuries(char, hum, root, speed)
+		safeCall("injuries", fall.injury.onLand, char, hum, root, speed)
 	end
 end
 
@@ -4715,6 +4759,447 @@ local function updateKnockdown(dt, character, humanoid, hrp)
 		fall.stumbleT = 0.8 -- wobbly as you get back up
 		fall.stumbleDur = 0.8
 	end
+end
+
+--------------------------------------------------------------------------------
+-- 6i. INJURIES (broken bones, concussion, stronger sprains, pop-up messages)
+--------------------------------------------------------------------------------
+-- A hard landing (fall.injury.onLand) can break bones, concuss you and sprain an ankle.
+--   Legs:       one broken leg = slow, tiny jump, no sprint. Both = barely moving, no jump.
+--   Arms:       both broken = you can't hold tools. Any broken arm = you can't mantle.
+--   Ribs:       sprinting drains stamina faster, resting recovers it slower.
+--   Concussion: swaying camera, blur, dark screen edges, ear ringing. Severe = knocked out.
+--   Sprain:     slower, weak jump, and no sprinting while it is fresh.
+-- Broken bones mend by themselves (BONE_HEAL_SECONDS each). Pop-ups appear above the HUD.
+-- Everything is a field of fall.injury, so this adds no new top-level local variables.
+do
+local injury = fall.injury
+
+local RED = Color3.fromRGB(235, 75, 75)
+local YELLOW = Color3.fromRGB(240, 200, 70)
+local PURPLE = Color3.fromRGB(185, 125, 245)
+local GREEN = Color3.fromRGB(90, 220, 130)
+local ORANGE = Color3.fromRGB(255, 150, 60)
+
+-- Counters --------------------------------------------------------------------------
+injury.total = function()
+	local n = 0
+	for _, r in pairs(injury.regions) do n = n + r.bones end
+	return n
+end
+
+injury.legs = function()
+	local n = 0
+	if injury.regions.lLeg.bones > 0 then n = n + 1 end
+	if injury.regions.rLeg.bones > 0 then n = n + 1 end
+	return n
+end
+
+injury.arms = function()
+	local n = 0
+	if injury.regions.lArm.bones > 0 then n = n + 1 end
+	if injury.regions.rArm.bones > 0 then n = n + 1 end
+	return n
+end
+
+-- 0..1: how fresh and bad the current sprain is (the limp fades it out in its last 8 seconds)
+injury.sprainFactor = function()
+	return fall.sprainStrength * math.clamp(fall.sprainLeft / 8, 0, 1)
+end
+
+-- Questions the main loop asks ------------------------------------------------------
+injury.canSprint = function()
+	return injury.legs() == 0 and injury.sprainFactor() < injury.cfg.SPRINT_BLOCK_SPRAIN
+end
+
+injury.canMantle = function()
+	return injury.legs() == 0 and injury.arms() == 0
+end
+
+injury.speedMult = function()
+	local cfg = injury.cfg
+	local legs = injury.legs()
+	local m = 1
+	if legs >= 2 then m = cfg.LEG_BOTH_SPEED elseif legs == 1 then m = cfg.LEG_ONE_SPEED end
+	m = m * (1 - cfg.SPRAIN_SPEED_LOSS * injury.sprainFactor())
+	m = m * (1 - 0.08 * injury.conc.level * math.clamp(injury.conc.left / 12, 0, 1))
+	m = m * (1 - 0.04 * math.min(injury.regions.ribs.bones, 4))
+	return m
+end
+
+injury.jumpMult = function()
+	local cfg = injury.cfg
+	local legs = injury.legs()
+	local m = 1
+	if legs >= 2 then m = 0 elseif legs == 1 then m = cfg.LEG_ONE_JUMP end
+	m = m * (1 - cfg.SPRAIN_JUMP_LOSS * injury.sprainFactor())
+	if injury.regions.ribs.bones > 0 then m = m * 0.85 end
+	return m
+end
+
+-- Pop-ups (a stack of little cards above the HUD) -----------------------------------
+injury.createUI = function()
+	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+	local existing = playerGui:FindFirstChild("RealismInjuryPopups")
+	if existing then existing:Destroy() end
+
+	local gui = trackInstance(Instance.new("ScreenGui"))
+	gui.Name = "RealismInjuryPopups"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 11 -- just above the HUD (10)
+	gui.Parent = playerGui
+
+	local box = Instance.new("Frame")
+	box.Name = "Stack"
+	box.AnchorPoint = Vector2.new(1, 1)
+	box.Position = UDim2.new(1, -110, 1, -260) -- moved above the HUD panel every frame
+	box.Size = UDim2.fromOffset(280, 0)
+	box.AutomaticSize = Enum.AutomaticSize.Y
+	box.BackgroundTransparency = 1
+	box.Parent = gui
+
+	local layout = Instance.new("UIListLayout")
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.VerticalAlignment = Enum.VerticalAlignment.Bottom
+	layout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+	layout.Padding = UDim.new(0, 5)
+	layout.Parent = box
+
+	injury.ui = box
+end
+
+injury.popup = function(title, sub, color)
+	local box = injury.ui
+	if not box then return end
+	local cfg = injury.cfg
+	local ts = game:GetService("TweenService")
+
+	injury.count = injury.count + 1
+	while #injury.popups >= cfg.POPUP_MAX do
+		local old = table.remove(injury.popups, 1)
+		if old and old.Parent then old:Destroy() end
+	end
+
+	local h = 30
+	if sub then h = (string.len(sub) > 34) and 62 or 48 end
+
+	local f = Instance.new("Frame")
+	f.Name = "Popup"
+	f.LayoutOrder = injury.count
+	f.Size = UDim2.new(1, 0, 0, h)
+	f.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+	f.BackgroundTransparency = 1
+	f.BorderSizePixel = 0
+	f.Parent = box
+
+	local fc = Instance.new("UICorner")
+	fc.CornerRadius = UDim.new(0, 8)
+	fc.Parent = f
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = color
+	stroke.Thickness = 1.5
+	stroke.Transparency = 1
+	stroke.Parent = f
+
+	local tl = Instance.new("TextLabel")
+	tl.BackgroundTransparency = 1
+	tl.Position = UDim2.new(0, 12, 0, sub and 4 or 0)
+	tl.Size = UDim2.new(1, -20, 0, sub and 22 or 30)
+	tl.Font = Enum.Font.GothamBlack
+	tl.TextSize = 17
+	tl.TextColor3 = color
+	tl.TextStrokeColor3 = Color3.new(0, 0, 0)
+	tl.TextStrokeTransparency = 1
+	tl.TextTransparency = 1
+	tl.TextXAlignment = Enum.TextXAlignment.Left
+	tl.Text = title
+	tl.Parent = f
+
+	local sl = nil
+	if sub then
+		sl = Instance.new("TextLabel")
+		sl.BackgroundTransparency = 1
+		sl.Position = UDim2.new(0, 12, 0, 26)
+		sl.Size = UDim2.new(1, -20, 1, -30)
+		sl.Font = Enum.Font.Gotham
+		sl.TextSize = 12
+		sl.TextColor3 = Color3.fromRGB(205, 210, 220)
+		sl.TextTransparency = 1
+		sl.TextXAlignment = Enum.TextXAlignment.Left
+		sl.TextYAlignment = Enum.TextYAlignment.Top
+		sl.TextWrapped = true
+		sl.Text = sub
+		sl.Parent = f
+	end
+
+	local function fade(visible, time)
+		local info = TweenInfo.new(time)
+		ts:Create(f, info, { BackgroundTransparency = visible and 0.3 or 1 }):Play()
+		ts:Create(stroke, info, { Transparency = visible and 0.2 or 1 }):Play()
+		ts:Create(tl, info, { TextTransparency = visible and 0 or 1, TextStrokeTransparency = visible and 0.5 or 1 }):Play()
+		if sl then ts:Create(sl, info, { TextTransparency = visible and 0 or 1 }):Play() end
+	end
+
+	fade(true, 0.2)
+	table.insert(injury.popups, f)
+	task.delay(cfg.POPUP_TIME, function()
+		if not f.Parent then return end
+		fade(false, 0.5)
+		task.delay(0.55, function()
+			local i = table.find(injury.popups, f)
+			if i then table.remove(injury.popups, i) end
+			if f.Parent then f:Destroy() end
+		end)
+	end)
+end
+
+-- Injuries ---------------------------------------------------------------------------
+-- Picks which body part the next broken bone goes to (legs most likely, then ribs, then arms)
+injury.pick = function()
+	local weights = { lLeg = 3, rLeg = 3, ribs = 1.5, lArm = 1, rArm = 1 }
+	local caps = { lLeg = 4, rLeg = 4, lArm = 4, rArm = 4, ribs = 5 }
+	local total = 0
+	for _, key in ipairs(injury.order) do
+		if injury.regions[key].bones < caps[key] then total = total + weights[key] end
+	end
+	if total <= 0 then return nil end
+	local roll = math.random() * total
+	for _, key in ipairs(injury.order) do
+		if injury.regions[key].bones < caps[key] then
+			roll = roll - weights[key]
+			if roll <= 0 then return key end
+		end
+	end
+	return nil
+end
+
+injury.breakBones = function(n)
+	local cfg = injury.cfg
+	local legsBefore, armsBefore = injury.legs(), injury.arms()
+	local added = {}
+	local done = 0
+	for _ = 1, n do
+		local key = injury.pick()
+		if not key then break end
+		local r = injury.regions[key]
+		r.bones = r.bones + 1
+		r.timer = math.max(r.timer, cfg.BONE_HEAL_SECONDS)
+		added[key] = (added[key] or 0) + 1
+		done = done + 1
+	end
+	if done == 0 then return end
+
+	local parts = {}
+	for _, key in ipairs(injury.order) do
+		if added[key] then
+			table.insert(parts, injury.regions[key].name .. (added[key] > 1 and (" x" .. added[key]) or ""))
+		end
+	end
+	injury.popup(
+		string.format("BROKE %d %s!", done, done == 1 and "BONE" or "BONES"),
+		table.concat(parts, ", ") .. "  |  " .. injury.total() .. " broken in total",
+		RED
+	)
+	landingVelocity = landingVelocity - (2 + done * 0.6) -- the screen lurches with the crack
+
+	if injury.legs() >= 2 and legsBefore < 2 then
+		injury.popup("BOTH LEGS BROKEN", "You can barely move", ORANGE)
+	end
+	if injury.arms() >= 2 and armsBefore < 2 then
+		injury.popup("BOTH ARMS BROKEN", "You can't hold anything", ORANGE)
+	end
+	if done >= cfg.OPEN_FRACTURE_BONES and math.random() < 0.6 then
+		bleedSeverity = math.clamp(bleedSeverity + 0.4, 0, 1)
+		injury.popup("OPEN FRACTURE", "You're bleeding - use a Bandage", RED)
+	end
+end
+
+injury.concuss = function(level, character, humanoid, hrp)
+	local cfg = injury.cfg
+	local c = injury.conc
+	local dur = cfg.CONCUSSION_MIN_DUR + (cfg.CONCUSSION_MAX_DUR - cfg.CONCUSSION_MIN_DUR) * (level - 1) / 2
+	if c.left > 0 then dur = dur + 20 end -- hit your head again while still dazed
+	c.level = math.max(c.level, level)
+	c.left = math.max(c.left, dur)
+
+	local names = { "Mild", "Moderate", "Severe" }
+	injury.popup("CONCUSSION", names[level] .. "  |  vision and balance affected", PURPLE)
+	landingVelocity = landingVelocity - 3
+
+	if level >= 3 and not faint and not ragdollData and humanoid and hrp then
+		startFaint(character, humanoid, hrp) -- a severe one knocks you out
+	end
+end
+
+injury.onSprain = function(strength)
+	local side = (math.random() < 0.5) and "LEFT" or "RIGHT"
+	injury.popup(
+		"SPRAINED " .. side .. " ANKLE",
+		string.format("Limping for ~%ds  |  no sprinting while it's fresh", math.floor(fall.sprainLeft)),
+		YELLOW
+	)
+end
+
+-- Called after every hard landing (and by the test buttons)
+injury.onLand = function(character, humanoid, hrp, speed)
+	local cfg = injury.cfg
+	if not cfg.ENABLE or humanoid.Health <= 0 then return end
+	local sev = math.clamp((speed - 62) / math.max(CONFIG.FALL_DAMAGE_LETHAL_SPEED - 62, 1), 0, 1)
+
+	if speed >= cfg.BREAK_SPEED and math.random() < math.clamp(cfg.BREAK_CHANCE_BASE + sev, 0, 1) then
+		local n = 1 + math.floor(sev * 6 * math.random() + math.random() * 1.2)
+		injury.breakBones(math.clamp(n, 1, cfg.BONES_MAX))
+	end
+
+	if speed >= cfg.CONCUSSION_SPEED and math.random() < math.clamp(0.25 + sev, 0, 1) then
+		local level = math.clamp(1 + math.floor(sev * 2 + math.random() * 0.8), 1, 3)
+		injury.concuss(level, character, humanoid, hrp)
+	end
+end
+
+-- Per-frame upkeep ---------------------------------------------------------------------
+injury.restoreJump = function()
+	if injury.jumpScaled and injury.jp0 then
+		local char = LocalPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum.JumpPower = injury.jp0
+			hum.JumpHeight = injury.jh0
+		end
+	end
+	injury.jumpScaled = false
+	injury.jp0, injury.jh0 = nil, nil
+end
+
+injury.update = function(dt, character, humanoid, hrp, isSprinting, isMoving)
+	local cfg = injury.cfg
+
+	-- Pop-up stack sits right above the HUD panel, whatever size it is
+	local panel = injury.panel
+	if not panel or not panel.Parent then
+		local pg = LocalPlayer:FindFirstChild("PlayerGui")
+		local hud = pg and pg:FindFirstChild("RealismHUD")
+		panel = hud and hud:FindFirstChild("Panel")
+		injury.panel = panel
+	end
+	if panel and injury.ui then
+		injury.ui.Position = UDim2.new(1, -110, 1, -(panel.AbsoluteSize.Y + 22))
+	end
+
+	if not cfg.ENABLE then return end
+
+	-- Bones mend one at a time
+	for _, key in ipairs(injury.order) do
+		local r = injury.regions[key]
+		if r.bones > 0 then
+			r.timer = r.timer - dt
+			if r.timer <= 0 then
+				r.bones = r.bones - 1
+				if r.bones > 0 then
+					r.timer = cfg.BONE_HEAL_SECONDS
+				else
+					local left = injury.total()
+					injury.popup(string.upper(r.name) .. " HEALED",
+						left > 0 and (left .. " bones still broken") or "All your bones have mended", GREEN)
+				end
+			end
+		end
+	end
+
+	-- Concussion: sways, blurs and darkens the view, then wears off
+	local c = injury.conc
+	local inten = 0
+	if c.left > 0 then
+		c.left = c.left - dt
+		if c.left <= 0 then
+			c.left, c.level = 0, 0
+			injury.popup("CONCUSSION WORE OFF", nil, GREEN)
+		else
+			inten = (c.level / 3) * math.clamp(c.left / 12, 0, 1)
+		end
+	end
+	local t = os.clock()
+	injury.roll = (math.sin(t * 1.3) * math.rad(4) + math.sin(t * 2.7) * math.rad(1.5)) * inten
+	injury.pitch = math.sin(t * 0.9 + 1) * math.rad(1.6) * inten
+	injury.yaw = math.sin(t * 1.1 + 2) * math.rad(1.8) * inten
+	injury.blur = 10 * inten
+	injury.vignette = 0.75 * inten
+	injury.ring = inten
+
+	-- Broken ribs: hurts to run, slow to catch your breath
+	local ribs = injury.regions.ribs.bones
+	if ribs > 0 then
+		local n = math.min(ribs, 3)
+		if isSprinting then
+			stamina = math.max(0, stamina - CONFIG.STAMINA_DRAIN_RATE * cfg.RIB_DRAIN * n * dt)
+		else
+			local regen = isMoving and CONFIG.STAMINA_REGEN_WALK or CONFIG.STAMINA_REGEN_RATE
+			stamina = math.max(0, stamina - regen * cfg.RIB_REGEN_LOSS * n * dt)
+		end
+	end
+
+	-- Both arms broken: tools drop back into the backpack
+	if injury.arms() >= 2 and character:FindFirstChildOfClass("Tool") then
+		humanoid:UnequipTools()
+		if os.clock() - injury.armWarn > 6 then
+			injury.armWarn = os.clock()
+			injury.popup("BOTH ARMS BROKEN", "You can't hold anything", ORANGE)
+		end
+	end
+
+	-- Jump: broken legs and fresh sprains weaken it (the stance code owns it while crouched or sitting)
+	if stance.mode == "stand" and not stance.dirty then
+		local m = injury.jumpMult()
+		if m < 0.999 or injury.jumpScaled then
+			local bp = stance.ready and stance.baseJumpPower or (injury.jp0 or humanoid.JumpPower)
+			local bh = stance.ready and stance.baseJumpHeight or (injury.jh0 or humanoid.JumpHeight)
+			injury.jp0, injury.jh0 = bp, bh
+			humanoid.JumpPower = bp * m
+			humanoid.JumpHeight = bh * m
+			injury.jumpScaled = m < 0.999
+		end
+	end
+end
+
+-- A fresh body (respawn or the HEAL test button)
+injury.reset = function()
+	for _, r in pairs(injury.regions) do
+		r.bones, r.timer = 0, 0
+	end
+	injury.conc.level, injury.conc.left = 0, 0
+	injury.roll, injury.pitch, injury.yaw = 0, 0, 0
+	injury.blur, injury.vignette, injury.ring = 0, 0, 0
+	injury.restoreJump()
+end
+
+injury.restore = function()
+	injury.reset()
+end
+
+-- Test buttons (the lightning menu)
+injury.test = function(kind)
+	local char = LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not hum or not root or hum.Health <= 0 then return end
+	if kind == "break" then
+		injury.breakBones(math.random(2, 6))
+	elseif kind == "sprain" then
+		fall.sprainLeft = 40
+		fall.sprainStrength = 0.9
+		injury.onSprain(0.6)
+	elseif kind == "conc" then
+		injury.concuss(math.random(1, 2), char, hum, root)
+	elseif kind == "heal" then
+		injury.reset()
+		fall.sprainLeft, fall.sprainStrength = 0, 0
+		injury.popup("ALL HEALED", nil, GREEN)
+	end
+end
+
+safeCall("injury popups", injury.createUI)
 end
 
 --------------------------------------------------------------------------------
@@ -4797,6 +5282,7 @@ local function mainUpdate(deltaTime)
 		-- Fall injuries: stumble, then a sprained ankle, then a knockdown
 		if peakFallSpeed > CONFIG.FALL_STUMBLE_SPEED and not faint and not fall.knock then
 			applyFallInjuries(character, humanoid, hrp, peakFallSpeed)
+			safeCall("injuries", fall.injury.onLand, character, humanoid, hrp, peakFallSpeed)
 		end
 
 		peakFallSpeed = 0
@@ -4829,7 +5315,7 @@ local function mainUpdate(deltaTime)
 	local flatVelocity = Vector3.new(hrp.AssemblyLinearVelocity.X, 0, hrp.AssemblyLinearVelocity.Z)
 	local isMoving = flatVelocity.Magnitude > 1.5
 	local isAdrenalineActive = adrenaline > 1
-	local wantsToSprint = (shiftPressed or mobileSprinting) and isMoving and stance.mode == "stand"
+	local wantsToSprint = (shiftPressed or mobileSprinting) and isMoving and stance.mode == "stand" and fall.injury.canSprint()
 
 	if stamina <= 0 then
 		exhausted = true
@@ -4850,6 +5336,8 @@ local function mainUpdate(deltaTime)
 		regen = regen * (1 - CONFIG.TEMP_REGEN_PENALTY * math.max(coldAmt, heatAmt)) -- extreme temperatures slow recovery
 		stamina = math.clamp(stamina + (regen * deltaTime), 0, CONFIG.MAX_STAMINA)
 	end
+
+	safeCall("injuries", fall.injury.update, deltaTime, character, humanoid, hrp, isSprinting, isMoving)
 
 	-- C2b. Pass out after walking too long while exhausted
 	if not faint then
@@ -4875,7 +5363,7 @@ local function mainUpdate(deltaTime)
 	end
 
 	-- C4. Mantling (only from a standing position)
-	if not faint and not fall.knock and stance.mode == "stand" then
+	if not faint and not fall.knock and stance.mode == "stand" and fall.injury.canMantle() then
 		safeCall("mantle", updateMantle, deltaTime, humanoid, hrp, character)
 	end
 
@@ -4890,7 +5378,7 @@ local function mainUpdate(deltaTime)
 	lastLookVector = currentLookVector
 
 	local normalizedDelta = cameraRotDelta * ((1 / 60) / math.max(deltaTime, 1 / 240))
-	local targetBlur = math.clamp(normalizedDelta * CONFIG.MOTION_BLUR_INTENSITY, 0, CONFIG.MAX_BLUR) + staminaVisual * CONFIG.STAMINA_BLUR_MAX
+	local targetBlur = math.clamp(normalizedDelta * CONFIG.MOTION_BLUR_INTENSITY, 0, CONFIG.MAX_BLUR) + staminaVisual * CONFIG.STAMINA_BLUR_MAX + fall.injury.blur
 	motionBlur.Size = motionBlur.Size + (targetBlur - motionBlur.Size) * math.clamp(deltaTime * 12, 0, 1)
 
 	-- E. Hunger & thirst decay
@@ -4960,6 +5448,7 @@ local function mainUpdate(deltaTime)
 
 	-- Crouching, crawling and sitting slow you down (stance.cur.speed eases between stances)
 	targetSpeed = targetSpeed * stance.cur.speed
+	targetSpeed = targetSpeed * fall.injury.speedMult()
 
 	humanoid.WalkSpeed = targetSpeed
 	Camera.FieldOfView = Camera.FieldOfView + (targetFOV - Camera.FieldOfView) * math.clamp(deltaTime * 5, 0, 1)
@@ -5014,7 +5503,7 @@ local function mainUpdate(deltaTime)
 		frame.BackgroundTransparency = 1 - vignetteAlpha
 	end
 
-	local staminaAlpha = staminaVisual * CONFIG.STAMINA_VIGNETTE_MAX
+	local staminaAlpha = math.max(staminaVisual * CONFIG.STAMINA_VIGNETTE_MAX, fall.injury.vignette)
 	for _, frame in ipairs(staminaFrames) do
 		frame.BackgroundTransparency = 1 - staminaAlpha
 	end
@@ -5130,6 +5619,8 @@ local function resetStateForNewCharacter()
 	fall.sprainLeft, fall.sprainStrength = 0, 0
 	fall.knock = nil
 
+	fall.injury.reset()
+
 	-- Fresh eyes: open, no squint, no blink in progress
 	eyes.reset()
 
@@ -5208,6 +5699,7 @@ _G.RealismCleanup = function()
 	-- Put the legs, hips and jump back the way they were
 	pcall(stance.restore)
 	pcall(sky.restore)
+	pcall(fall.injury.restore)
 	pcall(water.restore)
 
 	for _, inst in ipairs(createdInstances) do
