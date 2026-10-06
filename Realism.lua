@@ -9,6 +9,7 @@
 -- v5: SKY (twilight palette, stars, sun/moon size, clouds, storm clouds)
 -- v4 stance fix: real leg geometry, torso leans about the hips, camera follows the real head
 -- v8: EYES (blinking, squinting at the sun), lightning-squircle test menu (all test buttons live in it now)
+-- v10: IMPACTS: you go limp when you fall fast, get flung or stop dead; injuries depend on speed and WHICH body part hits
 -- v8.2: stances use real custom animations (Action4) and a shrinking hitbox; joint poses stay as a fallback
 
 local __toasts = 0
@@ -554,6 +555,43 @@ fall.injury = {
 	blur = 0, vignette = 0, ring = 0,    -- concussion screen / audio effects
 	ui = nil, panel = nil, count = 0, popups = {}, armWarn = -100,
 	jumpScaled = false, jp0 = nil, jh0 = nil,
+}
+
+-- Impacts (ragdoll triggers + per-body-part injuries). Functions are defined in section 6j.
+-- Speeds are studs/second. A normal jump lands at ~50, walking is ~10-16.
+fall.impact = {
+	active = false,
+	cfg = {
+		ENABLE = true,
+		-- When you go limp
+		FALL_RAGDOLL_SPEED = 60,     -- falling faster than this (downward) = you lose control (about a 9 stud drop)
+		FAST_RAGDOLL_SPEED = 90,     -- total speed in ANY direction while airborne (flung, launched, thrown)
+		FALL_RAGDOLL_TIME = 0.08,    -- seconds above the limit before you go limp
+		STOP_MIN_SPEED = 32,         -- sideways speed you must have had for a sudden stop to hurt (also 1.8x walk speed)
+		STOP_DROP = 0.65,            -- ...and you must lose this fraction of it...
+		STOP_WINDOW = 0.15,          -- ...within this many seconds
+		COOLDOWN = 1.0,              -- seconds after getting up before it can happen again
+		TUMBLE_SPIN = 7,             -- how hard you spin when you go limp (rad/s)
+		-- How hits are measured: speed one body part loses in a collision (within 0.2s)
+		MIN_HIT = 24,                -- softer hits are ignored (limbs flopping around)
+		MAX_HIT = 170,               -- a hit this hard is the worst case
+		PART_COOLDOWN = 0.3,         -- one body part can only be 'hit' this often
+		DAMAGE_CURVE = 1.4,          -- higher = light hits hurt less, hard hits hurt the same
+		ZONE_DAMAGE = { head = 1.5, torso = 1.0, arm = 0.45, leg = 0.6 }, -- x max health at the worst hit
+		-- Speeds where each injury becomes possible
+		HEAD_CONC = 42,              -- head hit: concussion (severe = knocked out)
+		RIB_BREAK = 70,              -- torso hit: broken ribs
+		INTERNAL_BLEED = 105,        -- torso hit: internal bleeding
+		ARM_BREAK = 72,              -- arm hit: that arm breaks
+		LEG_SPRAIN = 55,             -- leg hit: sprained ankle
+		LEG_BREAK = 80,              -- leg hit: that leg breaks
+		-- Getting back up
+		MIN_DOWN = 1.5,              -- seconds on the ground at least (plus 1s per 45 studs/s of the worst hit)
+		SETTLE_SPEED = 4,            -- the body must slow below this...
+		SETTLE_TIME = 0.6,           -- ...for this long before you stand up
+		MAX_TIME = 14,               -- never stay limp longer than this
+	},
+	parts = {}, conns = {}, hist = {}, fallT = 0, cool = 0, lastPopup = -100, state = nil,
 }
 
 -- Stances (everything in one table; its functions are defined in section 3c).
@@ -2334,6 +2372,9 @@ local function createHUD()
 		testButton("SPRAIN", function() fall.injury.test("sprain") end)
 		testButton("CONCUSS", function() fall.injury.test("conc") end)
 		testButton("HEAL", function() fall.injury.test("heal") end)
+		testButton("TOSS", function() fall.impact.test("toss") end)
+		testButton("SLAM", function() fall.impact.test("slam") end)
+		testButton("HEADHIT", function() fall.impact.test("head") end)
 		testButton("BLINK", function()
 			eyes.blink(false)
 		end)
@@ -5028,7 +5069,7 @@ injury.concuss = function(level, character, humanoid, hrp)
 	injury.popup("CONCUSSION", names[level] .. "  |  vision and balance affected", PURPLE)
 	landingVelocity = landingVelocity - 3
 
-	if level >= 3 and not faint and not ragdollData and humanoid and hrp then
+	if level >= 3 and not faint and (not ragdollData or fall.impact.active) and humanoid and hrp then
 		startFaint(character, humanoid, hrp) -- a severe one knocks you out
 	end
 end
@@ -5202,6 +5243,381 @@ end
 safeCall("injury popups", injury.createUI)
 end
 
+
+--------------------------------------------------------------------------------
+-- 6j. IMPACTS (go limp when falling / flung / stopped dead; injuries by body part)
+--------------------------------------------------------------------------------
+-- You go limp (ragdoll) when:
+--   * you fall faster than FALL_RAGDOLL_SPEED, or move faster than FAST_RAGDOLL_SPEED while airborne
+--   * you were moving fast sideways and stop almost instantly (a wall, a crash)
+-- While limp, every body part is watched: when a part loses a lot of speed in a collision, that
+-- HIT depends on how fast it was AND which part it was:
+--   head  > damage x1.5, concussion (severe = knocked out)
+--   torso > winded, broken ribs, internal bleeding
+--   arm   > that arm breaks      leg > sprained ankle, then that leg breaks
+-- You get up once the body has stopped moving (harder hits keep you down longer).
+-- Everything is a field of fall.impact, so this adds no new top-level local variables.
+do
+local imp = fall.impact
+local cfg = imp.cfg
+
+local RED = Color3.fromRGB(235, 75, 75)
+local YELLOW = Color3.fromRGB(240, 200, 70)
+local ORANGE = Color3.fromRGB(255, 150, 60)
+
+local function zoneOf(name)
+	if name == "Head" then return "head", nil end
+	if name == "Torso" or name == "UpperTorso" or name == "LowerTorso" or name == "HumanoidRootPart" then
+		return "torso", nil
+	end
+	local side = string.find(name, "Left") and "l" or (string.find(name, "Right") and "r" or nil)
+	if string.find(name, "Arm") or string.find(name, "Hand") then return "arm", side end
+	if string.find(name, "Leg") or string.find(name, "Foot") then return "leg", side end
+	return nil, nil
+end
+
+-- Remember which collidable thing each body part touched last (this is how a hit is matched to a part)
+imp.detach = function()
+	for _, c in ipairs(imp.conns) do c:Disconnect() end
+	table.clear(imp.conns)
+	table.clear(imp.parts)
+end
+
+imp.attach = function(character)
+	character:WaitForChild("HumanoidRootPart", 5)
+	task.wait(0.3) -- let the rest of the body load in
+	if LocalPlayer.Character ~= character then return end
+	imp.detach()
+	for _, part in ipairs(character:GetChildren()) do
+		if part:IsA("BasePart") then
+			local zone, side = zoneOf(part.Name)
+			if zone then
+				local e = { zone = zone, side = side, samples = {}, touch = -100, hit = -100 }
+				imp.parts[part] = e
+				table.insert(imp.conns, part.Touched:Connect(function(other)
+					if other.CanCollide and not other:IsDescendantOf(character) then
+						e.touch = os.clock()
+					end
+				end))
+			end
+		end
+	end
+end
+
+-- Breaks bones in ONE specific region (the random version in 6i can't aim)
+local function addBones(key, n)
+	local injury = fall.injury
+	local r = injury.regions[key]
+	local cap = (key == "ribs") and 5 or 4
+	local add = math.min(n, cap - r.bones)
+	if add <= 0 then return end
+	local legsBefore, armsBefore = injury.legs(), injury.arms()
+	r.bones = r.bones + add
+	r.timer = math.max(r.timer, injury.cfg.BONE_HEAL_SECONDS)
+	injury.popup(
+		"BROKE " .. string.upper(r.name),
+		string.format("%d bone%s  |  %d broken in total", add, add == 1 and "" or "s", injury.total()),
+		RED
+	)
+	landingVelocity = landingVelocity - (2 + add * 0.6)
+	if injury.legs() >= 2 and legsBefore < 2 then
+		injury.popup("BOTH LEGS BROKEN", "You can barely move", ORANGE)
+	end
+	if injury.arms() >= 2 and armsBefore < 2 then
+		injury.popup("BOTH ARMS BROKEN", "You can't hold anything", ORANGE)
+	end
+end
+
+local function sideKey(e, prefix)
+	local side = e.side or ((math.random() < 0.5) and "l" or "r")
+	return side .. prefix -- "lArm", "rLeg"
+end
+
+-- One body part took a hit of `mag` studs/s
+imp.hit = function(e, mag, character, humanoid, hrp)
+	local injury = fall.injury
+	local sev = math.clamp((mag - cfg.MIN_HIT) / math.max(cfg.MAX_HIT - cfg.MIN_HIT, 1), 0, 1)
+	local zone = e.zone
+	local now = os.clock()
+	e.hit = now
+	if imp.state then imp.state.worst = math.max(imp.state.worst, mag) end
+
+	-- Damage: harder hits hurt much more, and the head takes the most
+	local dmg = humanoid.MaxHealth * (sev ^ cfg.DAMAGE_CURVE) * (cfg.ZONE_DAMAGE[zone] or 1)
+	if dmg > 0 then
+		humanoid.Health = math.max(0, humanoid.Health - dmg)
+	end
+	landingVelocity = landingVelocity - math.clamp(mag * 0.04, 0, 6)
+	adrenaline = 100
+
+	if mag >= 40 and now - imp.lastPopup > 0.5 then
+		imp.lastPopup = now
+		local label = (zone == "head") and "HEAD" or (zone == "torso") and "TORSO"
+			or ((e.side == "l") and "LEFT " or (e.side == "r") and "RIGHT " or "") .. string.upper(zone)
+		injury.popup(label .. " HIT", string.format("%d studs/s impact", math.floor(mag)), ORANGE)
+	end
+	if humanoid.Health <= 0 then return end
+
+	if zone == "head" then
+		if mag >= cfg.HEAD_CONC and math.random() < math.clamp(0.5 + sev * 1.2, 0, 1) then
+			local level = math.clamp(1 + math.floor(sev * 2.6 + math.random() * 0.8), 1, 3)
+			injury.concuss(level, character, humanoid, hrp)
+		end
+
+	elseif zone == "torso" then
+		stamina = math.max(0, stamina - (12 + 55 * sev)) -- the wind is knocked out of you
+		if mag >= cfg.RIB_BREAK and math.random() < math.clamp(0.4 + sev * 1.1, 0, 1) then
+			addBones("ribs", 1 + math.floor(sev * 3 * math.random() + math.random() * 0.8))
+		end
+		if mag >= cfg.INTERNAL_BLEED and math.random() < 0.6 then
+			bleedSeverity = math.clamp(bleedSeverity + 0.25 + 0.4 * sev, 0, 1)
+			injury.popup("INTERNAL BLEEDING", "You're bleeding - use a Bandage", RED)
+		end
+
+	elseif zone == "arm" then
+		if mag >= cfg.ARM_BREAK and math.random() < math.clamp(0.3 + sev * 1.2, 0, 1) then
+			addBones(sideKey(e, "Arm"), 1 + math.floor(sev * 2 * math.random()))
+		end
+
+	elseif zone == "leg" then
+		if mag >= cfg.LEG_BREAK and math.random() < math.clamp(0.3 + sev * 1.2, 0, 1) then
+			addBones(sideKey(e, "Leg"), 1 + math.floor(sev * 2 * math.random()))
+		elseif mag >= cfg.LEG_SPRAIN and math.random() < 0.75 then
+			local s = math.clamp((mag - cfg.LEG_SPRAIN) / math.max(cfg.LEG_BREAK - cfg.LEG_SPRAIN + 40, 1), 0, 1)
+			local fresh = fall.sprainLeft < 10
+			fall.sprainLeft = math.max(fall.sprainLeft, CONFIG.SPRAIN_MIN_TIME + (CONFIG.SPRAIN_MAX_TIME - CONFIG.SPRAIN_MIN_TIME) * s)
+			fall.sprainStrength = math.max(fall.sprainStrength, 0.5 + 0.5 * s)
+			if fresh then injury.onSprain(s) end
+		end
+	end
+end
+
+-- Goes limp. spin = tumble speed, axis = which way it spins (random if nil), carry = velocity every part gets
+imp.begin = function(character, humanoid, hrp, reason, spin, axis, carry)
+	if ragdollData or faint or fall.knock then return false end
+	startRagdoll(character, nil)
+	if not ragdollData then return false end
+
+	imp.active = true
+	imp.state = { t = 0, settle = 0, worst = 0, reason = reason, faint = false, wet = 0 }
+	imp.fallT = 0
+	table.clear(imp.hist)
+	for _, e in pairs(imp.parts) do table.clear(e.samples) end
+
+	local rnd = Vector3.new(math.random() * 2 - 1, math.random() * 2 - 1, math.random() * 2 - 1)
+	if rnd.Magnitude < 0.1 then rnd = Vector3.xAxis end
+	local a = axis and (axis + rnd.Unit * 0.35) or rnd
+	a = (a.Magnitude > 0.01) and a.Unit or Vector3.xAxis
+
+	for _, d in ipairs(character:GetChildren()) do
+		if d:IsA("BasePart") then
+			if carry then d.AssemblyLinearVelocity = carry end
+			d.AssemblyAngularVelocity = a * spin * (0.7 + math.random() * 0.6)
+		end
+	end
+	peakFallSpeed = 0
+	return true
+end
+
+local function flatLook(hrp)
+	local camLook = Camera.CFrame.LookVector
+	local look = Vector3.new(camLook.X, 0, camLook.Z)
+	if look.Magnitude < 0.01 then
+		look = Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z)
+	end
+	return look.Unit
+end
+
+local function release()
+	imp.active = false
+	imp.state = nil
+	imp.cool = cfg.COOLDOWN
+	table.clear(imp.hist)
+end
+
+-- Which body part took a sudden stop? One of the parts that touched something just now.
+local function pickTouched(now)
+	local list, anyTorso = {}, nil
+	for _, e in pairs(imp.parts) do
+		if e.zone == "torso" then anyTorso = anyTorso or e end
+		if now - e.touch <= 0.3 and e.zone ~= "leg" then table.insert(list, e) end
+	end
+	if #list == 0 then
+		for _, e in pairs(imp.parts) do
+			if now - e.touch <= 0.3 then table.insert(list, e) end
+		end
+	end
+	if #list == 0 then return anyTorso end
+	return list[math.random(1, #list)]
+end
+
+imp.update = function(dt, character, humanoid, hrp)
+	if not cfg.ENABLE then return end
+	local now = os.clock()
+	imp.cool = math.max(0, imp.cool - dt)
+
+	----------------------------------------------------------------------------
+	-- LIMP: watch every body part for collisions, then decide when to get up
+	----------------------------------------------------------------------------
+	if imp.active then
+		if not ragdollData then release() return end -- something else ended the ragdoll
+		local st = imp.state
+
+		for part, e in pairs(imp.parts) do
+			if part.Parent then
+				local sp = part.AssemblyLinearVelocity.Magnitude
+				local s = e.samples
+				s[#s + 1] = now
+				s[#s + 1] = sp
+				while #s > 0 and now - s[1] > 0.2 do
+					table.remove(s, 1)
+					table.remove(s, 1)
+				end
+				if now - e.touch <= 0.25 and now - e.hit >= cfg.PART_COOLDOWN then
+					local peak = 0
+					for i = 2, #s, 2 do
+						if s[i] > peak then peak = s[i] end
+					end
+					local drop = peak - sp
+					if drop >= cfg.MIN_HIT then
+						table.clear(s)
+						imp.hit(e, drop, character, humanoid, hrp)
+						if humanoid.Health <= 0 then return end
+					end
+				end
+			end
+		end
+
+		st.t = st.t + dt
+		if hrp.AssemblyLinearVelocity.Magnitude < cfg.SETTLE_SPEED then
+			st.settle = st.settle + dt
+		else
+			st.settle = 0
+		end
+
+		-- Landed in water: stop being limp, you can swim
+		st.wet = st.wet + dt
+		if st.wet > 0.3 and not faint then
+			st.wet = 0
+			if water.terrain and water.probe(hrp.Position) then
+				st.t = math.max(st.t, cfg.MIN_DOWN + st.worst / 45)
+				st.settle = cfg.SETTLE_TIME
+			end
+		end
+
+		if faint then st.faint = true end
+		if st.faint then
+			-- Knocked out: the faint code stands you up. Keep measuring hits until the body stops.
+			if st.settle >= cfg.SETTLE_TIME or st.t >= cfg.MAX_TIME then release() end
+			return
+		end
+
+		local minT = cfg.MIN_DOWN + st.worst / 45
+		if (st.t >= minT and st.settle >= cfg.SETTLE_TIME) or st.t >= cfg.MAX_TIME then
+			stopRagdoll(character, humanoid, hrp, flatLook(hrp))
+			release()
+			peakFallSpeed = 0
+			fall.stumbleT, fall.stumbleDur = 1.2, 1.2 -- wobbly as you get up
+			fall.dir = (math.random() < 0.5) and -1 or 1
+			landingVelocity = landingVelocity - 2
+		end
+		return
+	end
+
+	----------------------------------------------------------------------------
+	-- STANDING: look for the things that knock you off your feet
+	----------------------------------------------------------------------------
+	local state = humanoid:GetState()
+	if imp.cool > 0 or ragdollData or faint or fall.knock or mantle or humanoid.PlatformStand
+		or state == Enum.HumanoidStateType.Swimming
+		or state == Enum.HumanoidStateType.Climbing
+		or state == Enum.HumanoidStateType.Seated
+		or state == Enum.HumanoidStateType.Dead then
+		imp.fallT = 0
+		table.clear(imp.hist)
+		return
+	end
+
+	local vel = hrp.AssemblyLinearVelocity
+	local airborne = humanoid.FloorMaterial == Enum.Material.Air
+
+	-- 1. Falling fast, or flung
+	if airborne and (-vel.Y >= cfg.FALL_RAGDOLL_SPEED or vel.Magnitude >= cfg.FAST_RAGDOLL_SPEED) then
+		imp.fallT = imp.fallT + dt
+	else
+		imp.fallT = math.max(0, imp.fallT - dt * 2)
+	end
+	if imp.fallT >= cfg.FALL_RAGDOLL_TIME then
+		local spin = cfg.TUMBLE_SPIN * math.clamp(vel.Magnitude / 100, 0.4, 1.2)
+		if imp.begin(character, humanoid, hrp, "fall", spin, nil, nil) then
+			imp.lastPopup = now
+			fall.injury.popup("LOST CONTROL", string.format("Falling at %d studs/s", math.floor(vel.Magnitude)), YELLOW)
+		end
+		return
+	end
+
+	-- 2. Moving fast, then stopping dead (a wall, a crash)
+	local h = Vector3.new(vel.X, 0, vel.Z)
+	local hist = imp.hist
+	hist[#hist + 1] = now
+	hist[#hist + 1] = h.Magnitude
+	hist[#hist + 1] = h.Magnitude > 0.01 and h.Unit or Vector3.zero
+	while #hist > 0 and now - hist[1] > cfg.STOP_WINDOW + 0.05 do
+		table.remove(hist, 1)
+		table.remove(hist, 1)
+		table.remove(hist, 1)
+	end
+
+	local peakH, peakDir = 0, Vector3.zero
+	for i = 2, #hist, 3 do
+		if hist[i] > peakH then peakH, peakDir = hist[i], hist[i + 1] end
+	end
+	local minSpeed = math.max(cfg.STOP_MIN_SPEED, humanoid.WalkSpeed * 1.8)
+	if peakH >= minSpeed and h.Magnitude <= peakH * (1 - cfg.STOP_DROP) then
+		local lost = peakH - h.Magnitude
+		local carry = peakDir * peakH * 0.35 + Vector3.new(0, 4, 0)
+		local axis = Vector3.yAxis:Cross(peakDir) -- tips you over in the direction you were going
+		if imp.begin(character, humanoid, hrp, "stop", cfg.TUMBLE_SPIN * math.clamp(peakH / 60, 0.5, 1.2), axis, carry) then
+			local e = pickTouched(now)
+			if e then imp.hit(e, lost, character, humanoid, hrp) end
+		end
+	end
+end
+
+-- Respawn
+imp.reset = function()
+	imp.active = false
+	imp.state = nil
+	imp.cool = 0
+	imp.fallT = 0
+	table.clear(imp.hist)
+end
+
+imp.restore = function()
+	imp.reset()
+	imp.detach()
+end
+
+-- Test buttons
+imp.test = function(kind)
+	local char = LocalPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not hum or not root or hum.Health <= 0 or ragdollData then return end
+	if kind == "toss" then
+		-- Launch up and forward; you go limp once you fall fast enough
+		root.AssemblyLinearVelocity = root.CFrame.LookVector * 30 + Vector3.new(0, 90, 0)
+	elseif kind == "head" then
+		imp.begin(char, hum, root, "test", 4, nil, nil)
+		for e_part, e in pairs(imp.parts) do
+			if e.zone == "head" then imp.hit(e, 110, char, hum, root) break end
+		end
+	elseif kind == "slam" then
+		root.AssemblyLinearVelocity = root.CFrame.LookVector * 70
+	end
+end
+end
+
 --------------------------------------------------------------------------------
 -- 7. MAIN UPDATE LOOP
 --------------------------------------------------------------------------------
@@ -5242,6 +5658,7 @@ local function mainUpdate(deltaTime)
 
 	updateFaint(deltaTime, character, humanoid, hrp)
 	updateKnockdown(deltaTime, character, humanoid, hrp)
+	safeCall("impacts", fall.impact.update, deltaTime, character, humanoid, hrp)
 	safeCall("temperature", updateTemperature, deltaTime, character, humanoid, hrp)
 	local coldAmt = math.max(0, -temp.body)
 	local heatAmt = math.max(0, temp.body)
@@ -5263,7 +5680,7 @@ local function mainUpdate(deltaTime)
 		peakFallSpeed = math.max(peakFallSpeed, -hrp.AssemblyLinearVelocity.Y)
 	end
 
-	if fall.knock then peakFallSpeed = 0 end
+	if fall.knock or fall.impact.active then peakFallSpeed = 0 end -- tumbling is handled by the impact system
 
 	if wasAirborne and not airborne then
 		if peakFallSpeed > CONFIG.LANDING_MIN_SPEED then
@@ -5620,6 +6037,7 @@ local function resetStateForNewCharacter()
 	fall.knock = nil
 
 	fall.injury.reset()
+	fall.impact.reset()
 
 	-- Fresh eyes: open, no squint, no blink in progress
 	eyes.reset()
@@ -5640,6 +6058,7 @@ local function initCharacter(char)
 	task.spawn(safeCall, "gear creation", createClientGears)
 	task.spawn(safeCall, "sound setup", setupSounds, char)
 	task.spawn(safeCall, "stance setup", stance.setup, char)
+	task.spawn(safeCall, "impact setup", fall.impact.attach, char)
 end
 
 track(LocalPlayer.CharacterAdded:Connect(function(char)
@@ -5686,7 +6105,7 @@ if CONFIG.DEBUG_KEYS then
 	end))
 end
 
-__toast("v8 loaded OK. Tap the lightning squircle (top left) for test buttons. Stance button is above RUN (or press C).")
+__toast("v10 loaded OK (impact ragdoll on). Tap the lightning squircle (top left) for test buttons. Stance button is above RUN (or press C).")
 
 --------------------------------------------------------------------------------
 -- CLEANUP (runs automatically if the script is executed again)
@@ -5700,6 +6119,7 @@ _G.RealismCleanup = function()
 	pcall(stance.restore)
 	pcall(sky.restore)
 	pcall(fall.injury.restore)
+	pcall(fall.impact.restore)
 	pcall(water.restore)
 
 	for _, inst in ipairs(createdInstances) do
