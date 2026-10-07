@@ -148,6 +148,7 @@ local fx = {}
 local function resetFx()
 	fx.blur, fx.red, fx.dark, fx.flash, fx.bloom, fx.shake, fx.timeScale = 0, 0, 0, 0, 0, 0, 1
 	fx.brown, fx.dusk, fx.ash, fx.white = 0, 0, 0, 0
+	fx.threat = 0 -- 0..1, sent to Realism so events raise adrenaline (and so stress)
 end
 resetFx()
 
@@ -996,6 +997,7 @@ local function spawnBlackHole()
 		fx.bloom = math.max(fx.bloom, 0.3 * prox)
 		fx.dusk = math.max(fx.dusk, 0.55 * k + 0.45 * prox)
 		fx.timeScale = math.min(fx.timeScale, 1 - 0.8 * p2)
+		fx.threat = math.max(fx.threat, 0.25 * k + 0.75 * prox)
 		if self.sound then self.sound.Volume = 0.12 * k + 0.9 * prox * k end
 		return true
 	end
@@ -1083,6 +1085,7 @@ local function spawnPulsar()
 		fx.bloom = math.max(fx.bloom, irr * 1.2)
 		fx.shake = math.max(fx.shake, irr * 0.08)
 		fx.brown = math.max(fx.brown, k)
+		fx.threat = math.max(fx.threat, 0.15 * k + 0.25 * irr)
 		if self.buzz then self.buzz.Volume = 0.25 * irr end
 		if CONFIG.PULSAR_HIT_DAMAGE > 0 and ctx.hum and ctx.alive and irr > 0.5 then
 			ctx.hum.Health = math.max(0, ctx.hum.Health - CONFIG.PULSAR_HIT_DAMAGE * dt)
@@ -1142,6 +1145,7 @@ local function spawnSupernova()
 			self.star.Size = Vector3.one * (6 + 24 * p * p) * (1 + 0.06 * math.sin(t * 40))
 			self.star.Color = C(255, 110, 50):Lerp(Color3.new(1, 1, 1), p)
 			fx.bloom = math.max(fx.bloom, 0.5 * p)
+			fx.threat = math.max(fx.threat, 0.2 * p)
 			return true
 		end
 
@@ -1152,12 +1156,15 @@ local function spawnSupernova()
 			self.flashA = 0.25 + 0.75 * facing
 			self.shock.Transparency = 0.75
 			notice("SUPERNOVA")
+			if _G.RealismAstroEvent then pcall(_G.RealismAstroEvent, "supernova", 1) end
 		end
 		self.flashA = self.flashA * math.exp(-dt * 0.8)
 		fx.flash = math.max(fx.flash, self.flashA * 0.95)
 		fx.bloom = math.max(fx.bloom, self.flashA * 2)
 		fx.white = math.max(fx.white, self.flashA)
 		fx.ash = math.max(fx.ash, math.clamp(bt / 6, 0, 1))
+		local dPl = ctx.hrp and (ctx.hrp.Position - center).Magnitude or 1000
+		fx.threat = math.max(fx.threat, (0.5 + 0.5 * math.clamp(self.front / math.max(dPl, 1), 0, 1)) * math.clamp(1 - bt / 30, 0.2, 1))
 
 		self.star.Size = Vector3.one * math.max(0.01, 60 * (1 - bt / 6))
 		self.star.Transparency = math.clamp(bt / 6, 0, 1)
@@ -1261,6 +1268,7 @@ local function spawnMeteors()
 	e.update = function(self, dt, ctx)
 		self.t = self.t + dt
 		if self.t < CONFIG.METEOR_DURATION then
+			fx.threat = math.max(fx.threat, 0.2)
 			self.nextSpawn = self.nextSpawn - dt
 			while self.nextSpawn <= 0 do
 				self.nextSpawn = self.nextSpawn + rand(0.08, 0.25)
@@ -1311,6 +1319,8 @@ local function startEvent(kind)
 	local ok, e = xpcall(fn, traceback)
 	if ok and e then
 		table.insert(events, e)
+		local spike = { blackhole = 0.6, pulsar = 0.3, supernova = 0.4, meteors = 0.4 }
+		if _G.RealismAstroEvent then pcall(_G.RealismAstroEvent, kind, spike[kind] or 0.4) end
 	elseif not ok then
 		reportError("start " .. kind, e)
 	end
@@ -1327,6 +1337,7 @@ local function fullReset(withBlack)
 	world.beginRestore()
 	env.resetNow()
 	resetFx()
+	_G.RealismAstroThreat = 0
 	astro.swallow = false
 	if withBlack then
 		astro.black = 1
@@ -1532,6 +1543,8 @@ local function step(dt)
 
 	env.step(dt)
 
+	_G.RealismAstroThreat = alive and math.clamp(fx.threat, 0, 1) or 0
+
 	blurFx.Size = fx.blur
 	local tint = Color3.new(1, 1 - 0.45 * fx.red, 1 - 0.7 * fx.red)
 	ccFx.TintColor = tint:Lerp(C(240, 200, 150), env.amt.brown * 0.5)
@@ -1592,6 +1605,7 @@ _G.RealismAstroCleanup = function()
 	for _, inst in ipairs(created) do
 		if inst and inst.Parent then inst:Destroy() end
 	end
+	_G.RealismAstroThreat = nil
 	_G.RealismAstroCleanup = nil
 end
 
