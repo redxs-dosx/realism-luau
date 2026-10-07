@@ -1,0 +1,70 @@
+-- RealismLoader (LocalScript)
+
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+local BASE = "https://raw.githubusercontent.com/redxs-dosx/realism-luau/refs/heads/main/"
+
+local scripts = {
+	{ name = "Main script", url = BASE .. "Realism.lua" },
+	{ name = "Phone add-on", url = BASE .. "RealismPhone.lua" },
+	{ name = "Astro add-on", url = BASE .. "RealismAstro.lua" },
+}
+
+-- GUI
+local gui = Instance.new("ScreenGui")
+gui.Name = "RealismLoader"
+gui.ResetOnSpawn = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 220, 0, 170)
+frame.Position = UDim2.new(0.5, -110, 0.5, -85)
+frame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 36)
+title.BackgroundTransparency = 1
+title.Text = "Realism Loader"
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 16
+title.Parent = frame
+
+for i, info in ipairs(scripts) do
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(1, -24, 0, 34)
+	button.Position = UDim2.new(0, 12, 0, 36 + (i - 1) * 42)
+	button.BackgroundColor3 = Color3.fromRGB(55, 55, 65)
+	button.TextColor3 = Color3.new(1, 1, 1)
+	button.Font = Enum.Font.Gotham
+	button.TextSize = 14
+	button.Text = info.name
+	button.AutoButtonColor = true
+	button.Parent = frame
+	Instance.new("UICorner", button).CornerRadius = UDim.new(0, 8)
+
+	local busy = false
+	button.MouseButton1Click:Connect(function()
+		if busy then return end
+		busy = true
+		button.Text = "Loading..."
+
+		local ok, err = pcall(function()
+			loadstring(game:HttpGet(info.url))()
+		end)
+
+		if not ok then
+			warn("[RealismLoader] Failed to load " .. info.name .. ": " .. tostring(err))
+		end
+		button.Text = ok and "Loaded!" or "Failed"
+		task.wait(1.5)
+		button.Text = info.name
+		busy = false
+	end)
+end
