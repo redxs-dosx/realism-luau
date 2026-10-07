@@ -11,6 +11,8 @@
 -- v8: EYES (blinking, squinting at the sun), lightning-squircle test menu (all test buttons live in it now)
 -- v10: IMPACTS: you go limp when you fall fast, get flung or stop dead; injuries depend on speed and WHICH body part hits
 -- v8.2: stances use real custom animations (Action4) and a shrinking hitbox; joint poses stay as a fallback
+-- v11: STRESS (builds in small bits while adrenaline is up, fades very slowly) + RealismAstro hooks
+--      (_G.RealismAstroThreat / _G.RealismAstroEvent make astro events raise adrenaline)
 
 local __toasts = 0
 local function __toast(text)
@@ -134,6 +136,20 @@ local CONFIG = {
 	STAMINA_REGEN_WALK = 1,         -- stamina/sec recovered while walking (very slow)
 	SPRINT_RESUME_THRESHOLD = 20,
 	ADRENALINE_STAMINA_DRAIN_MULT = 0,
+
+	-- Stress: builds in small bits while adrenaline is up, and fades VERY slowly.
+	-- RealismAstro raises adrenaline during space events, so stress builds from those too.
+	ENABLE_STRESS = true,
+	STRESS_TICK_TIME = 1.5,         -- seconds between stress "bits" while adrenaline is high
+	STRESS_TICK_BIT = 2.5,          -- stress added per bit at full adrenaline (scales with adrenaline)
+	STRESS_ADRENALINE_MIN = 10,     -- adrenaline must be above this for bits to build
+	STRESS_SPIKE_MIN = 20,          -- an adrenaline jump bigger than this adds one extra bit
+	STRESS_SPIKE_BIT = 6,           -- stress added by a full 0 to 100 adrenaline spike
+	STRESS_DECAY = 0.15,            -- stress lost per second once adrenaline is gone (100 to 0 in ~11 min)
+	STRESS_REGEN_PENALTY = 0.4,     -- stamina regen lost at full stress
+	STRESS_SHAKE = 0.5,             -- camera tremor at full stress (starts at 40% stress)
+	STRESS_VIGNETTE_MAX = 0.35,     -- dark screen edges at full stress
+	STRESS_COLOR = Color3.fromRGB(220, 110, 170),
 
 	-- Stances: the STANCE button (or the C key) cycles Stand > Crouch > Sit > Crawl.
 	-- Angles are in degrees, measured against the WORLD:
@@ -488,6 +504,14 @@ local soundGen = 0
 local ragdollData = nil      -- declared up here so the render-step closure can see it
 local ragdollCamCF = nil
 
+-- Stress (one table = one local variable)
+local stress = {
+	value = 0,        -- 0..100
+	timer = 0,        -- counts up to the next bit
+	lastAdren = 0,    -- adrenaline last frame, used to spot sudden rises
+	warned = -100,
+}
+
 -- Bleeding
 local bleedSeverity = 0      -- 0 = not bleeding, 1 = worst bleed
 local bandaging = false
@@ -755,7 +779,7 @@ eyes.update = function(dt)
 				e.blinkDur = randRange(0.14, 0.2)
 			else
 				e.blinkT = nil
-				e.timer = randRange(2.5, 6) * (1 - 0.45 * staminaVisual) * (1 + 0.6 * adrenaline / 100)
+				e.timer = randRange(2.5, 6) * (1 - 0.45 * staminaVisual) * (1 + 0.6 * adrenaline / 100) * (1 - 0.35 * stress.value / 100)
 			end
 		else
 			local x = p < 0.4 and p / 0.4 or (1 - p) / 0.6 -- shuts fast, opens slower
@@ -2008,7 +2032,7 @@ local function createHUD()
 	versionTag.Name = "VersionTag"
 	versionTag.Size = UDim2.new(1, 0, 0, 14)
 	versionTag.BackgroundTransparency = 1
-	versionTag.Text = "Realism v9"
+	versionTag.Text = "Realism v11"
 	versionTag.TextColor3 = Color3.fromRGB(130, 140, 155)
 	versionTag.TextXAlignment = Enum.TextXAlignment.Right
 	versionTag.Font = Enum.Font.GothamMedium
@@ -2100,10 +2124,12 @@ local function createHUD()
 		adrenaline = makeRow("Adrenaline", CONFIG.ADRENALINE_COLOR, 6),
 		bleed = makeRow("Bleeding", CONFIG.BLEED_COLOR, 7),
 		temp = makeRow("Temperature", CONFIG.COLD_COLOR, 8),
+		stress = makeRow("Stress", CONFIG.STRESS_COLOR, 9),
 	}
 	rows.adrenaline.row.Visible = false
 	rows.bleed.row.Visible = false
 	rows.temp.row.Visible = false
+	rows.stress.row.Visible = false
 
 	-- Eases a bar toward its value, pulses it when low, and dims it while it isn't needed
 	local function setBar(r, frac, dt, text, needed)
@@ -2143,7 +2169,7 @@ local function createHUD()
 		-- main loop fills these in every frame, then calls update()
 		values = {
 			health = 1, hunger = 1, thirst = 1, sprint = 1, sprinting = false, strength = 0,
-			adrenaline = 0, bleed = 0, bandaging = false, temp = 0,
+			adrenaline = 0, bleed = 0, bandaging = false, temp = 0, stress = 0,
 		},
 		lastInfo = nil,
 	}
@@ -2173,6 +2199,10 @@ local function createHUD()
 			rows.bleed.label.Text = v.bandaging and "WRAPPING" or "BLEEDING"
 			setBar(rows.bleed, v.bleed, dt, "", true)
 		end
+
+		local showStress = v.stress > 0.01
+		rows.stress.row.Visible = showStress
+		if showStress then setBar(rows.stress, v.stress, dt, nil, true) end
 
 		local tempAmount = math.abs(v.temp)
 		local showTemp = tempAmount > 0.15
@@ -2375,6 +2405,9 @@ local function createHUD()
 		testButton("TOSS", function() fall.impact.test("toss") end)
 		testButton("SLAM", function() fall.impact.test("slam") end)
 		testButton("HEADHIT", function() fall.impact.test("head") end)
+		testButton("ASTRO", function()
+			if _G.RealismAstroEvent then _G.RealismAstroEvent("test", 1) end
+		end)
 		testButton("BLINK", function()
 			eyes.blink(false)
 		end)
@@ -2988,14 +3021,14 @@ local function updateAudio(deltaTime, humanoid, flatSpeed, healthPercent)
 	-- Heavy breathing: low stamina or adrenaline
 	if breathSound then
 		local tired = math.clamp((CONFIG.BREATH_STAMINA_START - stamina) / CONFIG.BREATH_STAMINA_START, 0, 1)
-		local factor = math.max(tired, (adrenaline / 100) * 0.5, math.max(0, temp.body) * 0.4)
+		local factor = math.max(tired, (adrenaline / 100) * 0.5, math.max(0, temp.body) * 0.4, stress.value / 100 * 0.35)
 		approachVolume(breathSound, factor * CONFIG.BREATH_MAX_VOLUME, deltaTime, 3)
 		breathSound.PlaybackSpeed = 0.9 + factor * 0.4
 	end
 
 	-- Heartbeat: low health, out of sprint, bleeding, and a little with adrenaline
 	local lowHealth = math.clamp((0.4 - healthPercent) / 0.4, 0, 1)
-	local heartFactor = math.max(lowHealth, depleted, (adrenaline / 100) * 0.35, bleedSeverity * 0.4)
+	local heartFactor = math.max(lowHealth, depleted, (adrenaline / 100) * 0.35, bleedSeverity * 0.4, stress.value / 100 * 0.3)
 	if heartSound then
 		approachVolume(heartSound, heartFactor * CONFIG.HEARTBEAT_MAX_VOLUME, deltaTime, 3)
 		heartSound.PlaybackSpeed = 0.9 + heartFactor * 0.5
@@ -5723,9 +5756,45 @@ local function mainUpdate(deltaTime)
 		adrenaline = 100
 	end
 
+	-- B2. Astro events: RealismAstro sets _G.RealismAstroThreat (0 to 1) while one is happening
+	local astroThreat = tonumber(_G.RealismAstroThreat) or 0
+	if astroThreat > 0.02 then
+		adrenaline = math.max(adrenaline, math.clamp(astroThreat, 0, 1) * 100)
+	end
+
 	-- C. Adrenaline decay
 	if adrenaline > 0 then
 		adrenaline = math.clamp(adrenaline - (CONFIG.ADRENALINE_DECAY * deltaTime), 0, 100)
+	end
+
+	-- C1. Stress: builds in small bits while adrenaline is up, fades very slowly
+	if CONFIG.ENABLE_STRESS then
+		local rise = adrenaline - stress.lastAdren
+		stress.lastAdren = adrenaline
+		if rise >= CONFIG.STRESS_SPIKE_MIN then
+			stress.value = math.min(100, stress.value + CONFIG.STRESS_SPIKE_BIT * rise / 100)
+		end
+		if adrenaline > CONFIG.STRESS_ADRENALINE_MIN then
+			stress.timer = stress.timer + deltaTime
+			if stress.timer >= CONFIG.STRESS_TICK_TIME then
+				stress.timer = 0
+				stress.value = math.min(100, stress.value + CONFIG.STRESS_TICK_BIT * adrenaline / 100)
+			end
+		else
+			stress.timer = 0
+			if adrenaline < 1 then
+				stress.value = math.max(0, stress.value - CONFIG.STRESS_DECAY * deltaTime)
+			end
+		end
+		if stress.value > 70 and os.clock() - stress.warned > 90 then
+			stress.warned = os.clock()
+			showNotice("You're on edge - find somewhere calm")
+		end
+		if stress.value > 40 then -- shaky camera
+			landingVelocity = landingVelocity + (math.random() - 0.5) * ((stress.value - 40) / 60) * CONFIG.STRESS_SHAKE * (deltaTime * 60)
+		end
+	else
+		stress.value = 0
 	end
 
 	-- C2. Sprint & stamina (you can only sprint while standing)
@@ -5751,6 +5820,7 @@ local function mainUpdate(deltaTime)
 		-- Walking barely recovers stamina; standing still recovers it quickly
 		local regen = isMoving and CONFIG.STAMINA_REGEN_WALK or CONFIG.STAMINA_REGEN_RATE
 		regen = regen * (1 - CONFIG.TEMP_REGEN_PENALTY * math.max(coldAmt, heatAmt)) -- extreme temperatures slow recovery
+		regen = regen * (1 - CONFIG.STRESS_REGEN_PENALTY * stress.value / 100) -- stress slows recovery
 		stamina = math.clamp(stamina + (regen * deltaTime), 0, CONFIG.MAX_STAMINA)
 	end
 
@@ -5905,7 +5975,7 @@ local function mainUpdate(deltaTime)
 
 	local targetBrightness = 0.02 + (0.13 * adrenalinePercent) + sunGlare * 0.2 + flash * 0.2
 	local targetContrast = 0.15 + (0.05 * adrenalinePercent) - sunGlare * 0.1
-	local targetSaturation = 0.1 + (0.1 * adrenalinePercent) - sunGlare * 0.25 - injuryVisual * 0.3 - staminaVisual * 0.15 - weather.rain * 0.12 - coldAmt * 0.1
+	local targetSaturation = 0.1 + (0.1 * adrenalinePercent) - sunGlare * 0.25 - injuryVisual * 0.3 - staminaVisual * 0.15 - weather.rain * 0.12 - coldAmt * 0.1 - stress.value / 100 * 0.08
 	local targetTint = WHITE:Lerp(WARM_TINT, golden * day * 0.5 * (1 - weather.rain)):Lerp(CONFIG.COLD_TINT, coldAmt * 0.35):Lerp(CONFIG.HOT_TINT, heatAmt * 0.3):Lerp(PAIN_TINT, injuryVisual * CONFIG.INJURY_TINT_MAX)
 
 	colorCorrection.Brightness = colorCorrection.Brightness + (targetBrightness - colorCorrection.Brightness) * blend
@@ -5920,7 +5990,7 @@ local function mainUpdate(deltaTime)
 		frame.BackgroundTransparency = 1 - vignetteAlpha
 	end
 
-	local staminaAlpha = math.max(staminaVisual * CONFIG.STAMINA_VIGNETTE_MAX, fall.injury.vignette)
+	local staminaAlpha = math.max(staminaVisual * CONFIG.STAMINA_VIGNETTE_MAX, fall.injury.vignette, stress.value / 100 * CONFIG.STRESS_VIGNETTE_MAX)
 	for _, frame in ipairs(staminaFrames) do
 		frame.BackgroundTransparency = 1 - staminaAlpha
 	end
@@ -5955,6 +6025,7 @@ local function mainUpdate(deltaTime)
 	hudValues.strength = legStrength / 100
 	hudValues.adrenaline = adrenaline / 100
 	hudValues.temp = temp.body
+	hudValues.stress = stress.value / 100
 	hudValues.bandaging = bandaging
 	if bleedSeverity > 0 then
 		-- While a bandage is being wrapped the bar drains toward empty
@@ -6039,6 +6110,8 @@ local function resetStateForNewCharacter()
 	fall.injury.reset()
 	fall.impact.reset()
 
+	stress.value, stress.timer, stress.lastAdren, stress.warned = 0, 0, 0, -100
+
 	-- Fresh eyes: open, no squint, no blink in progress
 	eyes.reset()
 
@@ -6105,7 +6178,21 @@ if CONFIG.DEBUG_KEYS then
 	end))
 end
 
-__toast("v10 loaded OK (impact ragdoll on). Tap the lightning squircle (top left) for test buttons. Stance button is above RUN (or press C).")
+-- Astro hooks (used by RealismAstro)
+--   _G.RealismAstroThreat = 0..1       set every frame while an event is active (0 when it ends)
+--   _G.RealismAstroEvent(name, 0..1)   one-shot adrenaline spike
+--   _G.RealismAPI.addAdrenaline(n) / addStress(n) / getStress()
+_G.RealismAstroEvent = function(name, intensity)
+	intensity = math.clamp(tonumber(intensity) or 1, 0, 1)
+	adrenaline = math.max(adrenaline, 100 * intensity)
+end
+_G.RealismAPI = {
+	addAdrenaline = function(n) adrenaline = math.clamp(adrenaline + (tonumber(n) or 0), 0, 100) end,
+	addStress = function(n) stress.value = math.clamp(stress.value + (tonumber(n) or 0), 0, 100) end,
+	getStress = function() return stress.value end,
+}
+
+__toast("v11 loaded OK (impact ragdoll on). Tap the lightning squircle (top left) for test buttons. Stance button is above RUN (or press C).")
 
 --------------------------------------------------------------------------------
 -- CLEANUP (runs automatically if the script is executed again)
@@ -6195,6 +6282,8 @@ _G.RealismCleanup = function()
 	end
 	table.clear(bloodPools)
 
+	_G.RealismAstroEvent = nil
+	_G.RealismAPI = nil
 	_G.RealismCleanup = nil
 end
 
